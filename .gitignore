@@ -211,5 +211,6 @@ data/raw/
 data/processed/
 models/
 .env
+
 # MLflow
 mlruns/
