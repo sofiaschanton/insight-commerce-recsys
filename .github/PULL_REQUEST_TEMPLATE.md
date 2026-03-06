@@ -2,7 +2,7 @@
 <!-- Breve resumen de los cambios y el contexto del problema que resuelven -->
 
 ## 🔗 Issue relacionado
-Closes #
+Card #
 
 ## 🧪 Tipo de cambio
 - [ ] ✨ Nueva funcionalidad
