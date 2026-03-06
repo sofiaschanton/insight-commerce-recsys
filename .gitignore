@@ -214,3 +214,6 @@ models/
 
 # MLflow
 mlruns/
+
+#Ignora los csv
+*.csv

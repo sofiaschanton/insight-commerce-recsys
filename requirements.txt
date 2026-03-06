@@ -14,3 +14,6 @@ python-dotenv
 pyyaml
 joblib
 optuna
+psycopg2
+faker
+tqdm
