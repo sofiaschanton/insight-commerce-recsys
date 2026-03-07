@@ -229,7 +229,7 @@ class DimensionalETL:
                 user_name,
                 user_address,
                 DATE_TRUNC('year', CURRENT_DATE - MAKE_INTERVAL(years := user_age))::DATE AS user_birthdate
-            FROM instacart_database.Users_Schema.users;
+            FROM Users_Schema.users;
         """
         query_ins_user = """
             INSERT INTO dim_user (user_key, user_name, user_address, user_birthdate) 
@@ -245,9 +245,9 @@ class DimensionalETL:
                 p.product_name,
                 a.aisle AS aisle_name,
                 d.department AS department_name
-            FROM instacart_database.Resources.products p
-            JOIN instacart_database.Resources.aisles a ON p.aisle_id = a.aisle_id
-            JOIN instacart_database.Departments.departments d ON p.department_id = d.department_id;
+            FROM Resources.products p
+            JOIN Resources.aisles a ON p.aisle_id = a.aisle_id
+            JOIN Departments.departments d ON p.department_id = d.department_id;
         """
         query_ins_product = """
             INSERT INTO dim_product (product_key, product_name, aisle_name, department_name) 
@@ -269,11 +269,11 @@ class DimensionalETL:
                 op.add_to_cart_order,
                 op.reordered,
                 o.eval_set AS get_eval
-            FROM instacart_database.Orders_Schema.orders o
+            FROM Orders_Schema.orders o
             JOIN (
-                SELECT order_id, product_id, add_to_cart_order, reordered FROM instacart_database.Orders_Schema.order_products_prior
+                SELECT order_id, product_id, add_to_cart_order, reordered FROM Orders_Schema.order_products_prior
                 UNION ALL
-                SELECT order_id, product_id, add_to_cart_order, reordered FROM instacart_database.Orders_Schema.order_products_train
+                SELECT order_id, product_id, add_to_cart_order, reordered FROM Orders_Schema.order_products_train
             ) op ON o.order_id = op.order_id
             WHERE o.eval_set IN ('prior', 'train');
         """
