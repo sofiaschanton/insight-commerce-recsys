@@ -263,6 +263,7 @@ class DimensionalETL:
                 o.order_id AS order_key,
                 o.user_id AS user_key,
                 op.product_id AS product_key,
+                o.order_number,
                 o.order_dow,
                 CAST(o.order_hour_of_day AS SMALLINT),
                 o.days_since_prior_order,
