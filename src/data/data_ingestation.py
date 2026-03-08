@@ -27,19 +27,19 @@ load_dotenv(ROOT_DIR / '.env')
 load_dotenv(ROOT_DIR / '.env.example')
 
 # Las buscamos en nuestro .env
-supa_host = os.getenv('supa_host')
-supa_database = os.getenv('supa_database') 
-supa_user = os.getenv('supa_user')
-supa_password = os.getenv('supa_password')
-supa_port = os.getenv('supa_port')
+local_host = os.getenv('local_host')
+local_database = os.getenv('local_database') 
+local_user = os.getenv('local_user')
+local_password = os.getenv('local_password')
+local_port = os.getenv('local_port')
 
 # Configruacion de Postgres para hacer la conexion
 DB_CONFIG = {
-    'host': supa_host,
-    'database': supa_database,
-    'user': supa_user,
-    'password': supa_password,
-    'port': supa_port
+    'host': local_host,
+    'database': local_database,
+    'user': local_user,
+    'password': local_password,
+    'port': local_port
 }
 
 # Faker es una libreria que crea datos sinteticos, seran necesarios para algunos nombres
