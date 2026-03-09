@@ -21,7 +21,7 @@ logging.basicConfig(
     ]
 )
 
-load_dotenv('.env') # Inicializamos las variables de entorno
+load_dotenv(dotenv_path='/home/asus_juan/Documents/GitHub/insight-commerce-recsys/.env') # Inicializamos las variables de entorno
 
 # Las buscamos en nuestro .env
 host = os.getenv('host')
@@ -130,27 +130,6 @@ class DataIngestation:
             ))
 
         return users
-    
-    # Generamos los ID de ordenes 
-    def generate_order(self, count=3421083):
-        """
-        Genera una lista de identificadores únicos para las Orders.
-
-        Args:
-            count (int, optional): Cantidad de órdenes a generar. Por defecto es 3421083. Numero maximo del dataset
-
-        Returns:
-            list: Lista con los IDs de las Orders generadas.
-        """
-        logging.info("Generando order_id")
-
-        orders = []
-
-        for i in tqdm(range(1, count + 1), desc="Generando Orders"):
-            order_id = i
-            orders.append(i)
-
-        return orders
 
     # Insertamos los usuarios a la tabla de usaurios mediante una query
     def insert_users(self, users_data, schema='users_schema', table='users'):
@@ -177,33 +156,6 @@ class DataIngestation:
             execute_batch(self.cursor, insert_query, users_data, page_size=10000)
             self.connection.commit()
             self.counters['users'] = len(users_data)
-            logging.info("Usuarios insertados correctamente")
-        except Exception as e:
-            self.connection.rollback()
-            logging.error(f"Error insertando usuarios: {e}")
-
-    # Insertamos las ordenes id
-    def insert_orders(self, orders_data, schema='orders_schema', table='order'):
-        """
-        Inserta de forma masiva (batch) los identificadores de las órdenes en la base de datos.
-
-        Args:
-            orders_data (list): Lista con los identificadores de las órdenes a insertar.
-            schema (str, optional): Nombre del esquema en la base de datos. Por defecto 'orders_schema'.
-            table (str, optional): Nombre de la tabla. Por defecto 'order'.
-        """
-        logging.info(f"Insertando {len(orders_data)} usuarios a {schema}.{table}..")
-
-        insert_query = f"""
-            INSERT INTO {schema}.{table} (
-                order_id
-            ) VALUES (%s)
-        """
-
-        try:
-            execute_batch(self.cursor, insert_query, orders_data, page_size=10000)
-            self.connection.commit()
-            self.counters['order'] = len(orders_data)
             logging.info("Usuarios insertados correctamente")
         except Exception as e:
             self.connection.rollback()
@@ -250,7 +202,6 @@ class DataIngestation:
         # Conteos finales
         tables = [            
             'departments.departments',
-            'orders_schema.order',
             'orders_schema.order_products_prior',
             'orders_schema.order_products_train',
             'orders_schema.orders',
@@ -294,13 +245,10 @@ class DataIngestation:
         users_data = self.generate_users()
         self.insert_users(users_data, schema='users_schema', table='users')
 
-        orders_data = self.generate_order()
-        self.insert_orders(orders_data, schema='orders_schema', table='order')
-
         files_mapping = [
             ('departments.csv', 'departments', 'departments'),
-            ('order_products_prior.csv', 'orders_schema', 'order_products_prior'),
-            ('order_products_train.csv', 'orders_schema', 'order_products_train'),
+            ('order_products__prior.csv', 'orders_schema', 'order_products_prior'),
+            ('order_products__train.csv', 'orders_schema', 'order_products_train'),
             ('orders.csv', 'orders_schema', 'orders'),
             ('aisles.csv', 'resources', 'aisles'),
             ('products.csv', 'resources', 'products')
@@ -308,17 +256,18 @@ class DataIngestation:
 
         for file_name, schema, table in files_mapping:
             file_path = os.path.join(csv_directory, file_name)
-            self.load_csv_fast(file_path, schema, table)
+            self.load_csv_kaggle_data(file_path, schema, table)
 
         logging.info("Resumen")
         for table, count in self.counters.items():
             logging.info(f"{table}: {count} registros")
-
+        self.generate_summary_report()
         self.close()
+
 
 if __name__ == "__main__":
 
-    PATH_TO_CSVS = "./data" # Colocar la ruta de los CSV
+    PATH_TO_CSVS = "/home/asus_juan/Documents/GitHub/insight-commerce-recsys/src/data" # Colocar la ruta de los CSV
 
     etl = DataIngestation(DB_CONFIG)
     etl.run_etl(PATH_TO_CSVS)

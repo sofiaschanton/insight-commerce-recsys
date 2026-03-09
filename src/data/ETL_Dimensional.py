@@ -15,24 +15,24 @@ logging.basicConfig(
     ]
 )
 
-load_dotenv('.env')
+load_dotenv(dotenv_path='/home/asus_juan/Documents/GitHub/insight-commerce-recsys/.env')
 
 # Credenciales Locales (Importante ajustar en el .env con los mismo nombres de variable)
 LOCAL_DB_CONFIG = {
-    'host': os.getenv('localhost'),
-    'database': os.getenv('database_local'),
-    'user': os.getenv('user_local'),
-    'password': os.getenv('local_password'),
-    'port': os.getenv('local_port')
-}
-
-# Credenciales Supabase (Para saber donde encontrar las credeciales revisa /docs/SUPABASE_SETUP.md)
-SUPA_DB_CONFIG = {
     'host': os.getenv('host'),
     'database': os.getenv('database'),
     'user': os.getenv('user'),
     'password': os.getenv('password'),
     'port': os.getenv('port')
+}
+
+# Credenciales Supabase (Para saber donde encontrar las credeciales revisa /docs/SUPABASE_SETUP.md)
+SUPA_DB_CONFIG = {
+    'host': os.getenv('host_sup'),
+    'database': os.getenv('database_sup'),
+    'user': os.getenv('user_sup'),
+    'password': os.getenv('password_sup'),
+    'port': os.getenv('port_sup')
 }
 
 class DimensionalETL:
@@ -259,37 +259,70 @@ class DimensionalETL:
         # Transformación: Unimos las órdenes con los detalles (prior y train) 
         # para traer el target 'reordered' y el 'eval_set'.
         query_ext_fact = """
+            WITH All_Orders AS (
+                -- 1. Unificamos las ordenes de Prior y Train para no repetir subconsultas
+                SELECT order_id, product_id, add_to_cart_order, reordered 
+                FROM Orders_Schema.order_products_prior
+                UNION ALL
+                SELECT order_id, product_id, add_to_cart_order, reordered 
+                FROM Orders_Schema.order_products_train
+            ),
+            Clientes_Frecuentes AS (
+                -- 2. Condición #1: Clientes con más de 5 órdenes en total
+                -- FIX: Se eliminó ORDER BY y LIMIT que sesgaban la selección de usuarios
+                SELECT user_id
+                FROM Orders_Schema.orders
+                GROUP BY user_id
+                HAVING COUNT(order_id) > 5
+                LIMIT 20000
+            ),
+            Productos_Reordenados AS (
+                -- 3. Condición #2: Productos que se han reordenado más de 50 veces (globalmente)
+                SELECT product_id
+                FROM All_Orders 
+                WHERE reordered = 1
+                GROUP BY product_id
+                HAVING COUNT(*) > 50
+            ),
+            Ordenes_Con_Populares AS (
+                -- 4. Condición #3: Todas las ordenes que almenos tengan un producto reordenado mas de 50 veces
+                SELECT DISTINCT order_id
+                FROM All_Orders
+                WHERE product_id IN (SELECT product_id FROM Productos_Reordenados)
+            )
+            -- Consulta Principal
             SELECT 
                 o.order_id AS order_key,
                 o.user_id AS user_key,
                 op.product_id AS product_key,
-                o.order_number,
                 o.order_dow,
                 CAST(o.order_hour_of_day AS SMALLINT),
                 o.days_since_prior_order,
                 op.add_to_cart_order,
                 op.reordered,
+                o.order_number,
                 o.eval_set AS get_eval
             FROM Orders_Schema.orders o
-            JOIN (
-                SELECT order_id, product_id, add_to_cart_order, reordered FROM Orders_Schema.order_products_prior
-                UNION ALL
-                SELECT order_id, product_id, add_to_cart_order, reordered FROM Orders_Schema.order_products_train
-            ) op ON o.order_id = op.order_id
+            JOIN All_Orders op ON o.order_id = op.order_id
+            -- El INNER JOIN actúa como filtro: si el usuario o la orden no existen en los CTEs, se descartan
+            JOIN Clientes_Frecuentes cf ON o.user_id = cf.user_id
+            JOIN Ordenes_Con_Populares ocp ON o.order_id = ocp.order_id
             WHERE o.eval_set IN ('prior', 'train');
         """
+
         query_ins_fact = """
             INSERT INTO fact_order_products (
                 order_key, user_key, product_key, order_dow, order_hour_of_day, 
-                days_since_prior_order, add_to_cart_order, reordered, get_eval
+                days_since_prior_order, add_to_cart_order, reordered, order_number, get_eval
             ) VALUES %s ON CONFLICT (order_key, product_key) DO NOTHING;
         """
+        
         # Usamos un chunk_size de 10,000 para balancear uso de RAM y velocidad de red hacia Supabase
         self.transfer_data(query_ext_fact, 'fact_order_products', query_ins_fact, chunk_size=10000)
 
-        self.close()
-
         self.generate_report()
+        
+        self.close()
 
 if __name__ == "__main__":
     etl = DimensionalETL(LOCAL_DB_CONFIG, SUPA_DB_CONFIG)

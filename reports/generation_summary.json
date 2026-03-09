@@ -1,0 +1,13 @@
+{
+  "generation_date": "2026-03-09T11:36:22.144294",
+  "total_records": 37496241,
+  "table_counts": {
+    "departments": 21,
+    "order_products_prior": 32434489,
+    "order_products_train": 1384617,
+    "orders": 3421083,
+    "aisles": 134,
+    "products": 49688,
+    "users": 206209
+  }
+}
