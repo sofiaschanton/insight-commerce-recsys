@@ -5,6 +5,7 @@ import random
 import logging
 import json
 import os
+from pathlib import Path
 from psycopg2.extras import execute_batch
 from tqdm import tqdm
 from faker import Faker
@@ -21,22 +22,24 @@ logging.basicConfig(
     ]
 )
 
-load_dotenv('.env') # Inicializamos las variables de entorno
+ROOT_DIR = Path(__file__).resolve().parents[2]
+load_dotenv(ROOT_DIR / '.env')
+load_dotenv(ROOT_DIR / '.env.example')
 
 # Las buscamos en nuestro .env
-host = os.getenv('host')
-database = os.getenv('database') 
-user = os.getenv('user')
-password = os.getenv('password')
-port = os.getenv('port')
+local_host = os.getenv('local_host')
+local_database = os.getenv('local_database') 
+local_user = os.getenv('local_user')
+local_password = os.getenv('local_password')
+local_port = os.getenv('local_port')
 
 # Configruacion de Postgres para hacer la conexion
 DB_CONFIG = {
-    'host': host,
-    'database': database,
-    'user': user,
-    'password': password,
-    'port': port
+    'host': local_host,
+    'database': local_database,
+    'user': local_user,
+    'password': local_password,
+    'port': local_port
 }
 
 # Faker es una libreria que crea datos sinteticos, seran necesarios para algunos nombres
@@ -98,6 +101,34 @@ class DataIngestation:
         if self.connection:
             self.connection.close()
         logging.info("Conexion cerrada")
+
+    def table_has_records(self, schema, table):
+        """
+        Verifica si una tabla ya contiene registros.
+
+        Args:
+            schema (str): Esquema de la tabla.
+            table (str): Nombre de la tabla.
+
+        Returns:
+            bool: True si la tabla tiene al menos un registro.
+        """
+        self.cursor.execute(f"SELECT EXISTS (SELECT 1 FROM {schema}.{table} LIMIT 1)")
+        return self.cursor.fetchone()[0]
+
+    def get_table_count(self, schema, table):
+        """
+        Obtiene la cantidad de registros actuales de una tabla.
+
+        Args:
+            schema (str): Esquema de la tabla.
+            table (str): Nombre de la tabla.
+
+        Returns:
+            int: Cantidad de registros en la tabla.
+        """
+        self.cursor.execute(f"SELECT COUNT(*) FROM {schema}.{table}")
+        return self.cursor.fetchone()[0]
     
     # Generamos los usuarios
     def generate_users(self, count=206209):
@@ -148,7 +179,7 @@ class DataIngestation:
 
         for i in tqdm(range(1, count + 1), desc="Generando Orders"):
             order_id = i
-            orders.append(i)
+            orders.append((order_id,))
 
         return orders
 
@@ -291,24 +322,51 @@ class DataIngestation:
         if not self.connect():
             return
 
-        users_data = self.generate_users()
-        self.insert_users(users_data, schema='users_schema', table='users')
+        if self.table_has_records('users_schema', 'users'):
+            current_users = self.get_table_count('users_schema', 'users')
+            self.counters['users'] = current_users
+            logging.info(f"users_schema.users ya contiene datos ({current_users}). Se omite la carga de usuarios")
+        else:
+            users_data = self.generate_users()
+            self.insert_users(users_data, schema='users_schema', table='users')
 
-        orders_data = self.generate_order()
-        self.insert_orders(orders_data, schema='orders_schema', table='order')
+        if self.table_has_records('orders_schema', 'order'):
+            current_orders = self.get_table_count('orders_schema', 'order')
+            self.counters['order'] = current_orders
+            logging.info(f"orders_schema.order ya contiene datos ({current_orders}). Se omite la carga de order_id")
+        else:
+            orders_data = self.generate_order()
+            self.insert_orders(orders_data, schema='orders_schema', table='order')
+
+        csv_base_path = Path(csv_directory)
+        if not csv_base_path.is_absolute():
+            csv_base_path = (ROOT_DIR / csv_base_path).resolve()
+
+        if not csv_base_path.exists():
+            logging.error(f"El directorio de CSV no existe: {csv_base_path}")
+            self.close()
+            return
 
         files_mapping = [
-            ('departments.csv', 'departments', 'departments'),
-            ('order_products_prior.csv', 'orders_schema', 'order_products_prior'),
-            ('order_products_train.csv', 'orders_schema', 'order_products_train'),
-            ('orders.csv', 'orders_schema', 'orders'),
-            ('aisles.csv', 'resources', 'aisles'),
-            ('products.csv', 'resources', 'products')
+        # Primero las tablas de referencia (sin dependencias)
+        ('departments.csv', 'departments', 'departments'),
+        ('aisles.csv', 'resources', 'aisles'),
+        ('products.csv', 'resources', 'products'),
+        # Después las tablas que dependen de products y orders
+        ('orders.csv', 'orders_schema', 'orders'),
+        ('order_products__prior.csv', 'orders_schema', 'order_products_prior'),
+        ('order_products__train.csv', 'orders_schema', 'order_products_train'),
         ]
 
         for file_name, schema, table in files_mapping:
-            file_path = os.path.join(csv_directory, file_name)
-            self.load_csv_fast(file_path, schema, table)
+            if self.table_has_records(schema, table):
+                current_count = self.get_table_count(schema, table)
+                self.counters[table] = current_count
+                logging.info(f"{schema}.{table} ya contiene datos ({current_count}). Se omite la carga de {file_name}")
+                continue
+
+            file_path = str(csv_base_path / file_name)
+            self.load_csv_kaggle_data(file_path, schema, table)
 
         logging.info("Resumen")
         for table, count in self.counters.items():
@@ -318,7 +376,7 @@ class DataIngestation:
 
 if __name__ == "__main__":
 
-    PATH_TO_CSVS = "./data" # Colocar la ruta de los CSV
+    PATH_TO_CSVS = "data/raw" # Colocar la ruta de los CSV
 
     etl = DataIngestation(DB_CONFIG)
     etl.run_etl(PATH_TO_CSVS)
