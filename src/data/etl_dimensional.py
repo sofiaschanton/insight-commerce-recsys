@@ -1,6 +1,7 @@
 import psycopg2
 import logging
 import os
+from faker import Faker
 from psycopg2.extras import execute_values
 from dotenv import load_dotenv
 from datetime import datetime
@@ -46,8 +47,9 @@ NEON_DB_CONFIG = {
 N_USERS_APTOS    = 10_000
 MIN_USER_ORDERS  = 5    # Feature Schema v6.0
 MIN_PRODUCT_ORDERS = 50 # Feature Schema v6.0 — EDA Sección 3
-
-
+RANDOM_SEED  = int(os.getenv('RANDOM_SEED', 42))
+BATCH_SIZE   = 1_000
+FAKER_LOCALE = 'en_US'
 class DimensionalETL:
     def __init__(self, local_config: dict, neon_config: dict):
         """
@@ -145,10 +147,85 @@ class DimensionalETL:
                 "error"           : error_msg,
             }
 
+    # Gracias al uso de POO podemos unir el escript populate_dim_user.py en el mismo etl 
+    def populate_dim_user():
+        """
+        populate_dim_user.py
+        Puebla las columnas user_name, user_address y user_birthdate de dim_user
+        en Neon con datos sintéticos generados con Faker.
+
+        Ejecutar una sola vez después de la subida de las tablas
+
+        Requisitos:
+            pip install faker psycopg2-binary python-dotenv
+        """
+
+        fake = Faker(FAKER_LOCALE)
+        Faker.seed(RANDOM_SEED)
+
+        try:
+            conn = psycopg2.connect(**NEON_DB_CONFIG)
+            cur  = conn.cursor()
+            logging.info("Conexión a Neon exitosa.")
+
+            # ── Obtener user_keys que tienen NULL en user_name ─────────────────────
+            cur.execute("""
+                SELECT user_key
+                FROM dim_user
+                WHERE user_name IS NULL
+                ORDER BY user_key
+            """)
+            user_keys = [row[0] for row in cur.fetchall()]
+            logging.info(f"Usuarios a poblar: {len(user_keys):,}")
+
+            if not user_keys:
+                logging.info("Todos los usuarios ya tienen datos sintéticos. Nada que hacer.")
+                conn.close()
+                return
+
+            # ── Generar datos sintéticos ───────────────────────────────────────────
+            records = []
+            for user_key in user_keys:
+                records.append((
+                    fake.name(),
+                    fake.address().replace('\n', ', '),
+                    fake.date_of_birth(minimum_age=18, maximum_age=80),
+                    user_key
+                ))
+
+            # ── Actualizar en batches ──────────────────────────────────────────────
+            total_updated = 0
+            for i in range(0, len(records), BATCH_SIZE):
+                batch = records[i:i + BATCH_SIZE]
+                execute_values(
+                    cur,
+                    """
+                    UPDATE dim_user AS d SET
+                        user_name      = v.user_name,
+                        user_address   = v.user_address,
+                        user_birthdate = v.user_birthdate
+                    FROM (VALUES %s) AS v(user_name, user_address, user_birthdate, user_key)
+                    WHERE d.user_key = v.user_key
+                    """,
+                    batch,
+                    template="(%s, %s, %s::date, %s)"
+                )
+                conn.commit()
+                total_updated += len(batch)
+                logging.info(f"Actualizados: {total_updated:,} / {len(records):,}")
+
+            logging.info(f"Completado. {total_updated:,} usuarios poblados con datos sintéticos.")
+            conn.close()
+
+        except Exception as e:
+            logging.error(f"Error: {e}")
+            raise
+
     def generate_report(self):
         """
         Genera un reporte estructurado en logs con métricas por tabla
         y totales del pipeline.
+        
         """
         if not self.pipeline_start_time:
             logging.warning("El pipeline no fue iniciado correctamente.")
@@ -280,7 +357,7 @@ class DimensionalETL:
         neon_cursor.close()
 
         query_ext_fact = f"""
-            WITH All_Orders AS (
+            WITH All_Orders A/home/asus_juan/Documents/GitHub/insight-commerce-recsys/.envS (
                 SELECT order_id, product_id, add_to_cart_order, reordered
                 FROM Orders_Schema.order_products_prior
                 UNION ALL
@@ -322,10 +399,9 @@ class DimensionalETL:
         """
 
         self.transfer_data(query_ext_fact, 'fact_order_products', query_ins_fact, chunk_size=10_000)
-
+        self.populate_dim_user()
         self.generate_report()
         self.close()
-
 
 if __name__ == "__main__":
     etl = DimensionalETL(LOCAL_DB_CONFIG, NEON_DB_CONFIG)
