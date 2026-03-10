@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <title>Reporte de Calidad – Insight Commerce</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 40px; background: #f5f5f5; }
+    h1   { color: #222; border-bottom: 3px solid #f5c400; padding-bottom: 8px; }
+    h2   { color: #444; margin-top: 30px; }
+    table { border-collapse: collapse; width: 100%; background: white;
+             box-shadow: 0 2px 6px rgba(0,0,0,.1); }
+    th   { background: #222; color: white; padding: 12px; text-align: left; }
+    td   { padding: 10px 12px; border-bottom: 1px solid #eee; }
+    .ALTA    { background:#ff9944; color:white; font-weight:bold; border-radius:4px; padding:3px 8px; }
+    .CRITICO { background:#ff4444; color:white; font-weight:bold; border-radius:4px; padding:3px 8px; }
+    .MEDIA   { background:#ffdd44; font-weight:bold; border-radius:4px; padding:3px 8px; }
+    .OK      { background:#44bb44; color:white; font-weight:bold; border-radius:4px; padding:3px 8px; }
+    img  { max-width:100%; margin:15px 0; border-radius:8px; box-shadow:0 2px 8px rgba(0,0,0,.15); }
+    .meta { color:#666; font-size:.9em; margin-bottom:30px; }
+  </style>
+</head>
+<body>
+  <h1>🔍 Reporte de Calidad – Insight Commerce</h1>
+  <p class="meta">
+    Dataset: Instacart Online Grocery &nbsp;|&nbsp;
+    Modo: MVP (50,000 usuarios) &nbsp;|&nbsp;
+    Generado: 2026-03-06 09:56
+  </p>
+  <h2>Resumen ejecutivo</h2>
+  <table>
+    <tr><th>Riesgo</th><th>Métrica clave</th><th>Severidad</th><th>Acción sugerida</th></tr>
+
+    <tr>
+      <td><strong>Desbalance de clases</strong></td>
+      <td>Ratio 0:1 = 0.69</td>
+      <td><span class="BAJA">BAJA</span></td>
+      <td>class_weight / scale_pos_weight en el modelo</td>
+    </tr>
+    <tr>
+      <td><strong>Alta cardinalidad</strong></td>
+      <td>49,688 productos</td>
+      <td><span class="ALTA">ALTA</span></td>
+      <td>Filtrar productos con < 50 apariciones para el MVP</td>
+    </tr>
+    <tr>
+      <td><strong>Sparsity de usuarios</strong></td>
+      <td>Sparsity media = 99.8692%</td>
+      <td><span class="ALTA">ALTA</span></td>
+      <td>Filtrar usuarios con < 5 órdenes / popularidad como fallback</td>
+    </tr>
+    <tr>
+      <td><strong>Data leakage temporal</strong></td>
+      <td>Resultado: OK</td>
+      <td><span class="OK">OK</span></td>
+      <td>Estructura prior/train/test respetada ✅</td>
+    </tr>
+    <tr>
+      <td><strong>Sesgo hacia productos populares</strong></td>
+      <td>Top 1% = 41.9% compras</td>
+      <td><span class="MEDIA">MEDIA</span></td>
+      <td>Incluir features de popularidad relativa al usuario</td>
+    </tr>
+  </table>
+  <h2>Visualizaciones</h2>
+  <h3>Riesgo 1 – Desbalance de clases</h3><img src="figures/q1_desbalance_clases.png">
+  <h3>Riesgo 2 – Alta cardinalidad</h3><img src="figures/q2_alta_cardinalidad.png">
+  <h3>Riesgo 3 – Sparsity de usuarios</h3><img src="figures/q3_sparsity_usuarios.png">
+  <h3>Riesgo 4 – Leakage temporal</h3><img src="figures/q4_leakage_temporal.png">
+  <h3>Riesgo 5 – Sesgo de popularidad</h3><img src="figures/q5_sesgo_popularidad.png">
+</body></html>
