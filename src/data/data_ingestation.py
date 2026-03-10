@@ -12,19 +12,20 @@ from faker import Faker
 from dotenv import load_dotenv
 from datetime import datetime
 
+ROOT_DIR = Path(__file__).resolve().parents[2]
+log_path = ROOT_DIR / "reports" / "logs" / "data_loader.log"
+
 # Configuracion inicial para guardar los logs para asi ver en que nos equivocamos y guardar un reporte
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('./reports/logs/data_ingestation.log'), # Path donde se guarda el archivo con los logs
+        logging.FileHandler(str(log_path)), # Path donde se guarda el archivo con los logs
         logging.StreamHandler()
     ]
 )
 
-ROOT_DIR = Path(__file__).resolve().parents[2]
 load_dotenv(ROOT_DIR / '.env')
-load_dotenv(ROOT_DIR / '.env.example')
 
 # Las buscamos en nuestro .env
 local_host = os.getenv('local_host')

@@ -5,18 +5,25 @@ from faker import Faker
 from psycopg2.extras import execute_values
 from dotenv import load_dotenv
 from datetime import datetime
+import os
+from pathlib import Path
+
+# Esto detecta la carpeta raíz del proyecto sin importar desde dónde lo llames
+BASE_DIR = Path(__file__).resolve().parent.parent.parent
+# Configura el log usando la ruta absoluta calculada
+log_path = BASE_DIR / "reports" / "logs" / "data_loader.log"
 
 # ── Configuración de logs ──────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('reports/logs/dimensional_etl.log'),
+        logging.FileHandler(str(log_path)),
         logging.StreamHandler()
     ]
 )
 
-load_dotenv()
+load_dotenv(BASE_DIR/'.env')
 
 # ── Credenciales base de datos local ──────────────────────────────────────────
 LOCAL_DB_CONFIG = {
