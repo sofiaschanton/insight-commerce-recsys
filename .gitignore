@@ -209,7 +209,6 @@ __marimo__/
 # Datos y modelos
 data/raw/
 data/processed/
-/models/
 .env
 # MLflow
 mlruns/

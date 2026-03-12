@@ -2,20 +2,20 @@
 src/features/feature_engineering.py
 =====================================
 RESPONSABILIDAD: transformar los DataFrames del schema dimensional en el
-feature matrix listo para preprocessing.py.
+feature matrix listo para entrenamiento.
 
 Este módulo NO abre conexión a la base de datos, NO entrena modelos y
-NO imputa nulos con criterio estadístico — eso es responsabilidad de
-preprocessing.py. Su único trabajo es calcular features desde prior
-y construir el label desde train.
+NO imputa nulos con criterio estadístico — los NaN intencionales son
+consumidos directamente por LightGBM y CatBoost. Su único trabajo es
+calcular features desde prior y construir el label desde train.
 
 Flujo de datos
 --------------
     load_data_from_neon()  →  dict[str, pd.DataFrame]
             ↓  [este módulo]
     data/processed/feature_matrix.parquet   ← tiene NaN intencionales
-            ↓  [preprocessing.py]
-    data/processed/feature_matrix_clean.parquet
+            ↓  [train.py]
+    modelos LightGBM / CatBoost  ← manejan NaN de forma nativa
 
 Unidad de observación
 ---------------------
@@ -59,8 +59,8 @@ Columnas del feature matrix (26 total)
 
     Label           : label
 
-NaN intencionales — pendientes de imputación en preprocessing.py
------------------------------------------------------------------
+NaN intencionales — manejados de forma nativa por LightGBM y CatBoost
+---------------------------------------------------------------------
     p_department_reorder_rate  : NaN si dim_product no tiene department_key
     p_aisle_reorder_rate       : NaN si dim_product no tiene aisle_key
     up_avg_days_between_orders : NaN cuando up_times_purchased == 1
@@ -68,7 +68,7 @@ NaN intencionales — pendientes de imputación en preprocessing.py
     up_delta_days              : NaN donde up_avg_days_between_orders es NaN
 
     Estos NaN NO se imputan aquí porque imputar con 0 sería incorrecto
-    semánticamente. preprocessing.py los trata con mediana.
+    semánticamente. LightGBM y CatBoost aprenden splits óptimos con NaN.
 
 Filtros aplicados
 -----------------
@@ -85,7 +85,7 @@ Uso
     data   = load_data_from_neon()
     matrix = build_feature_matrix(data)
     # → guarda feature_matrix.parquet con NaN intencionales
-    # → siguiente paso: preprocessing.py
+    # → siguiente paso: train.py
 """
 
 import os
@@ -125,7 +125,7 @@ MIN_PRODUCT_ORDERS = 50   # productos con menos compras tienen tasas de reorden 
 # Segmentos de frecuencia de compra (user_segment_code)
 # Diseño: bins asimétricos porque la distribución de órdenes está sesgada a la derecha.
 # 1=esporádico(1-5) 2=ocasional(6-10) 3=regular(11-20) 4=frecuente(21-40) 5=power_user(41+)
-SEGMENT_BINS  = [0, 5, 10, 20, 40, 9999]
+SEGMENT_BINS  = [0, 5, 10, 20, 40, 101]
 SEGMENT_CODES = [1, 2, 3, 4, 5]
 
 
@@ -338,7 +338,7 @@ def get_product_features(
     Productos raros tienen tasas de reorden estadísticamente ruidosas.
 
     NaN: p_department_reorder_rate y p_aisle_reorder_rate quedan NaN si
-    dim_product no tiene las claves. Se imputan en preprocessing.py.
+    dim_product no tiene las claves. LightGBM y CatBoost los manejan de forma nativa.
     """
     logger.info("Calculando features de producto...")
 
@@ -444,13 +444,13 @@ def get_user_product_features(prior: pd.DataFrame) -> pd.DataFrame:
                                      = total_days_span / (times_purchased - 1)
                                      NaN cuando times_purchased == 1 — sin ciclo calculable.
                                      NO imputar con 0 (significaría ciclo instantáneo).
-                                     → preprocessing.py imputa con mediana.
+                                     → LightGBM/CatBoost aprenden el split óptimo con NaN.
 
         up_delta_days              : up_days_since_last - up_avg_days_between_orders
                                      > 0 : ya pasó el ciclo → señal fuerte de reorden
                                      < 0 : comprado muy recientemente → poco probable
                                      NaN donde up_avg_days_between_orders es NaN.
-                                     → preprocessing.py recalcula después de imputar.
+                                     → LightGBM/CatBoost manejan NaN de forma nativa.
 
     Features derivadas calculadas en build_feature_matrix (no aquí):
         up_reorder_rate              = up_times_purchased / user_total_orders
@@ -495,7 +495,7 @@ def get_user_product_features(prior: pd.DataFrame) -> pd.DataFrame:
     # up_avg_days_between_orders: total de días acumulados del par / (veces comprado - 1)
     # La división por 0 ocurre cuando times_purchased == 1 → NaN intencional.
     # No imputar con 0 porque significaría "ciclo de recompra instantáneo" — incorrecto.
-    # preprocessing.py imputa con mediana.
+    # LightGBM y CatBoost aprenden el split óptimo con NaN.
     up_order_days = (
         prior.merge(up[['user_key', 'product_key']], on=['user_key', 'product_key'], how='inner')
         .groupby(['user_key', 'product_key'])['days_since_prior_order']
@@ -507,15 +507,15 @@ def get_user_product_features(prior: pd.DataFrame) -> pd.DataFrame:
         up['_total_days_span'] / (up['up_times_purchased'] - 1)
     ).replace([np.inf, -np.inf], np.nan).astype('float32')
     # NaN cuando up_times_purchased == 1 (comprado solo una vez, sin ciclo de recompra)
-    # Se imputa con mediana en preprocessing.py — NO imputar con 0 (significaría ciclo instantáneo)
+    # NO imputar con 0 (significaría ciclo instantáneo) — LightGBM/CatBoost manejan NaN de forma nativa.
     n_nan = up['up_avg_days_between_orders'].isna().sum()
     if n_nan > 0:
-        logger.info(f"  up_avg_days_between_orders: {n_nan:,} NaN (up_times_purchased==1) — pendiente imputación en preprocessing.py")
+        logger.info(f"  up_avg_days_between_orders: {n_nan:,} NaN (up_times_purchased==1) — manejados nativamente por el modelo")
 
     # up_delta_days: señal clave para el modelo
     # > 0 = ya pasó el ciclo de recompra esperado → alta probabilidad de reorden
     # < 0 = comprado muy recientemente → baja probabilidad de reorden
-    # Hereda los NaN de up_avg_days_between_orders — el imputer los rellena en preprocessing.py
+    # Hereda los NaN de up_avg_days_between_orders — LightGBM/CatBoost los manejan de forma nativa
     up['up_delta_days'] = (
         up['up_days_since_last'] - up['up_avg_days_between_orders']
     ).astype('float32')
@@ -734,7 +734,7 @@ def build_feature_matrix(
         Puede tener NaN en: p_department_reorder_rate, p_aisle_reorder_rate,
         up_avg_days_between_orders, up_delta_days.
         El log final detalla cuántos NaN hay en cada columna.
-        Siguiente paso: preprocessing.py para imputación y escala.
+        Siguiente paso: train.py — LightGBM/CatBoost manejan los NaN de forma nativa.
     """
     logger.info("=" * 60)
     logger.info("Iniciando build_feature_matrix v4")
@@ -849,27 +849,27 @@ def build_feature_matrix(
                 df[col] = df[col].fillna(0)
                 logger.info(f"  fillna(0) en {col}: {n:,} nulos — {razon}")
 
-    # Columnas que deben llegar como NaN a preprocessing.py para imputación inteligente
-    PENDIENTE_PREPROCESSING = [
+    # Columnas con NaN intencionales — manejados de forma nativa por LightGBM y CatBoost
+    NAN_INTENCIONALES = [
         'p_department_reorder_rate',
         'p_aisle_reorder_rate',
         'up_avg_days_between_orders',
         'up_delta_days',
     ]
-    nan_report = {col: int(df[col].isna().sum()) for col in PENDIENTE_PREPROCESSING if col in df.columns}
+    nan_report = {col: int(df[col].isna().sum()) for col in NAN_INTENCIONALES if col in df.columns}
     nan_con_nulos = {col: n for col, n in nan_report.items() if n > 0}
     if nan_con_nulos:
-        logger.info("  Columnas con NaN — imputación pendiente en preprocessing.py:")
+        logger.info("  Columnas con NaN intencionales — manejados por LightGBM/CatBoost:")
         for col, n in nan_con_nulos.items():
             pct = n / len(df) * 100
             logger.info(f"    {col}: {n:,} NaN ({pct:.1f}%)")
     else:
-        logger.info("  Sin NaN pendientes para preprocessing.py")
+        logger.info("  Sin NaN intencionales en el feature matrix")
 
     # Cualquier otro nulo inesperado — warning explícito, NO fillna silencioso
     remaining_nulls = df.isnull().sum()
     remaining_nulls = remaining_nulls[remaining_nulls > 0]
-    unexpected = [c for c in remaining_nulls.index if c not in PENDIENTE_PREPROCESSING]
+    unexpected = [c for c in remaining_nulls.index if c not in NAN_INTENCIONALES]
     if unexpected:
         logger.warning(f"  NaN inesperados en columnas no contempladas: {unexpected}")
         logger.warning("  Revisar pipeline — estos NaN NO se imputan automáticamente")
@@ -892,7 +892,7 @@ def build_feature_matrix(
 
     # ── 9. Guardar ────────────────────────────────────────────────────────────
     # Parquet preserva tipos, comprime mejor y es más rápido que CSV.
-    # El parquet de salida tiene NaN intencionales — preprocessing.py los imputa.
+    # El parquet de salida tiene NaN intencionales — LightGBM/CatBoost los manejan de forma nativa.
     if output_path:
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
         df.to_parquet(output_path, index=False)
@@ -903,9 +903,9 @@ def build_feature_matrix(
 
 # ─── Entry point ──────────────────────────────────────────────────────────────
 if __name__ == '__main__':
-    from src.data.data_loader_local import load_data_from_local
+    from src.data.data_loader import load_data_from_neon
 
-    data   = load_data_from_local()
+    data   = load_data_from_neon()
     matrix = build_feature_matrix(data)
 
     print("\nFeature matrix generada:")
