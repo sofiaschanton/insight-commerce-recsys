@@ -1,0 +1,124 @@
+{
+  "timestamp": "2026-03-13T09:22:30.855353",
+  "model_name": "LightGBM optimizado",
+  "model_path": "models\\model.pkl",
+  "random_seed": 42,
+  "scale_pos_weight": 10.195995298041856,
+  "n_features": 25,
+  "feature_cols": [
+    "user_total_orders",
+    "user_avg_basket_size",
+    "user_days_since_last_order",
+    "user_reorder_ratio",
+    "user_distinct_products",
+    "user_segment_code",
+    "product_total_purchases",
+    "product_reorder_rate",
+    "product_avg_add_to_cart",
+    "product_unique_users",
+    "p_department_reorder_rate",
+    "p_aisle_reorder_rate",
+    "up_times_purchased",
+    "up_reorder_rate",
+    "up_orders_since_last_purchase",
+    "up_first_order_number",
+    "up_last_order_number",
+    "up_avg_add_to_cart_order",
+    "up_days_since_last",
+    "up_avg_days_between_orders",
+    "up_delta_days",
+    "u_favorite_department",
+    "u_favorite_aisle",
+    "user_cluster",
+    "product_cluster"
+  ],
+  "cat_features_lgbm": [
+    "user_segment_code",
+    "u_favorite_department",
+    "u_favorite_aisle",
+    "user_cluster",
+    "product_cluster"
+  ],
+  "split": {
+    "method": "by_users_70_15_15",
+    "n_train_users": 12560,
+    "n_val_users": 2691,
+    "n_test_users": 2691,
+    "n_train_pairs": 787850,
+    "n_val_pairs": 165227,
+    "n_test_pairs": 161294
+  },
+  "metrics_test": {
+    "precision": 0.3625561130182202,
+    "recall": 0.4602131795937521,
+    "f1": 0.4055890346212927,
+    "auc": 0.8134419746094651
+  },
+  "best_params": {
+    "n_estimators": 639,
+    "learning_rate": 0.2959007055890211,
+    "num_leaves": 136,
+    "max_depth": 10,
+    "min_child_samples": 88,
+    "subsample": 0.5940707288690343,
+    "colsample_bytree": 0.9792404814884555,
+    "reg_alpha": 3.069562908474676e-07,
+    "reg_lambda": 0.10767679910314054,
+    "scale_pos_weight": 10.195995298041856,
+    "random_state": 42,
+    "n_jobs": -1,
+    "verbose": -1
+  },
+  "importance_top10": [
+    {
+      "feature": "up_reorder_rate",
+      "importance": 24
+    },
+    {
+      "feature": "up_days_since_last",
+      "importance": 17
+    },
+    {
+      "feature": "product_reorder_rate",
+      "importance": 16
+    },
+    {
+      "feature": "user_reorder_ratio",
+      "importance": 13
+    },
+    {
+      "feature": "up_first_order_number",
+      "importance": 10
+    },
+    {
+      "feature": "up_delta_days",
+      "importance": 9
+    },
+    {
+      "feature": "user_days_since_last_order",
+      "importance": 9
+    },
+    {
+      "feature": "product_total_purchases",
+      "importance": 8
+    },
+    {
+      "feature": "u_favorite_aisle",
+      "importance": 8
+    },
+    {
+      "feature": "p_aisle_reorder_rate",
+      "importance": 6
+    }
+  ],
+  "features_zero_importance": [
+    "user_segment_code",
+    "p_department_reorder_rate",
+    "up_orders_since_last_purchase",
+    "up_avg_add_to_cart_order",
+    "up_avg_days_between_orders",
+    "u_favorite_department",
+    "user_cluster",
+    "product_cluster"
+  ]
+}
