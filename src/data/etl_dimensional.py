@@ -44,33 +44,33 @@ NEON_DB_CONFIG = {
 # N_USERS_APTOS: cantidad de usuarios aptos a cargar en Neon.
 # Un usuario apto cumple: >= 5 órdenes prior + exactamente 1 orden train.
 # Valor acordado para Neon free tier (0.5 GB): 10.000 usuarios aptos.
-N_USERS_APTOS    = 10_000
-MIN_USER_ORDERS  = 5    # Feature Schema v6.0
-MIN_PRODUCT_ORDERS = 50 # Feature Schema v6.0 — EDA Sección 3
-RANDOM_SEED  = int(os.getenv('RANDOM_SEED', 42))
-BATCH_SIZE   = 1_000
-FAKER_LOCALE = 'en_US'
+N_USERS_APTOS      = 10_000
+MIN_USER_ORDERS    = 5    # Feature Schema v6.0
+MIN_PRODUCT_ORDERS = 50   # Feature Schema v6.0 — EDA Sección 3
+RANDOM_SEED        = int(os.getenv('RANDOM_SEED', 42))
+BATCH_SIZE         = 1_000
+FAKER_LOCALE       = 'en_US'
+
+
 class DimensionalETL:
     def __init__(self, local_config: dict, neon_config: dict):
         """
         Inicializa el ETL con las configuraciones de conexión.
-
         Args:
             local_config (dict): Credenciales de la base de datos PostgreSQL local.
             neon_config  (dict): Credenciales de la base de datos Neon.
         """
-        self.local_config      = local_config
-        self.neon_config       = neon_config
-        self.local_conn        = None
-        self.neon_conn         = None
-        self.batch_id          = int(datetime.now().timestamp())
-        self.report_stats      = {}
+        self.local_config        = local_config
+        self.neon_config         = neon_config
+        self.local_conn          = None
+        self.neon_conn           = None
+        self.batch_id            = int(datetime.now().timestamp())
+        self.report_stats        = {}
         self.pipeline_start_time = None
 
     def connect(self) -> bool:
         """
         Establece conexiones a la base de datos local y a Neon.
-
         Returns:
             bool: True si ambas conexiones son exitosas, False en caso de error.
         """
@@ -101,7 +101,6 @@ class DimensionalETL:
         """
         Extrae datos de la base de datos local usando cursor del lado del servidor
         e inserta en Neon por lotes para optimizar uso de RAM y evitar timeouts.
-
         Args:
             extract_query (str): SQL SELECT para extraer datos del origen local.
             target_table  (str): Nombre de la tabla destino en Neon.
@@ -147,19 +146,12 @@ class DimensionalETL:
                 "error"           : error_msg,
             }
 
-    # Gracias al uso de POO podemos unir el escript populate_dim_user.py en el mismo etl 
     def populate_dim_user(self):
         """
-        populate_dim_user.py
         Puebla las columnas user_name, user_address y user_birthdate de dim_user
         en Neon con datos sintéticos generados con Faker.
-
-        Ejecutar una sola vez después de la subida de las tablas
-
-        Requisitos:
-            pip install faker psycopg2-binary python-dotenv
+        Ejecutar una sola vez después de la subida de las tablas.
         """
-
         fake = Faker(FAKER_LOCALE)
         Faker.seed(RANDOM_SEED)
 
@@ -168,7 +160,6 @@ class DimensionalETL:
             cur  = conn.cursor()
             logging.info("Usando conexión Neon existente para poblar datos sintéticos.")
 
-            # ── Obtener user_keys que tienen NULL en user_name ─────────────────────
             cur.execute("""
                 SELECT user_key
                 FROM dim_user
@@ -180,10 +171,8 @@ class DimensionalETL:
 
             if not user_keys:
                 logging.info("Todos los usuarios ya tienen datos sintéticos. Nada que hacer.")
-                conn.close()
                 return
 
-            # ── Generar datos sintéticos ───────────────────────────────────────────
             records = []
             for user_key in user_keys:
                 records.append((
@@ -193,7 +182,6 @@ class DimensionalETL:
                     user_key
                 ))
 
-            # ── Actualizar en batches ──────────────────────────────────────────────
             total_updated = 0
             for i in range(0, len(records), BATCH_SIZE):
                 batch = records[i:i + BATCH_SIZE]
@@ -217,14 +205,13 @@ class DimensionalETL:
             logging.info(f"Completado. {total_updated:,} usuarios poblados con datos sintéticos.")
 
         except Exception as e:
-            logging.error(f"Error: {e}")
+            logging.error(f"Error en populate_dim_user: {e}")
             raise
 
     def generate_report(self):
         """
         Genera un reporte estructurado en logs con métricas por tabla
         y totales del pipeline.
-        
         """
         if not self.pipeline_start_time:
             logging.warning("El pipeline no fue iniciado correctamente.")
@@ -245,6 +232,7 @@ class DimensionalETL:
             f"N_USERS_APTOS   : {N_USERS_APTOS:,}",
             f"MIN_USER_ORDERS : {MIN_USER_ORDERS}",
             f"MIN_PROD_ORDERS : {MIN_PRODUCT_ORDERS}",
+            f"RANDOM_SEED     : {RANDOM_SEED}",
             "-" * 75,
             f"{'TABLA DESTINO':<25} | {'ESTADO':<12} | {'FILAS':<10} | {'DURACIÓN':<15}",
             "-" * 75,
@@ -265,29 +253,43 @@ class DimensionalETL:
     def run_pipeline(self):
         """
         Orquesta la ejecución completa del pipeline ETL.
-
         Flujo:
           1. Registrar tiempo de inicio.
           2. Conectar a las bases de datos.
-          3. Transferir dim_user → dim_product → fact_order_products.
-          4. Cerrar conexiones.
-          5. Generar reporte.
-
+          3. Fijar semilla en PostgreSQL local para reproducibilidad.
+          4. Transferir dim_user → dim_product → fact_order_products.
+          5. Poblar datos sintéticos en dim_user.
+          6. Cerrar conexiones.
+          7. Generar reporte.
         Filtros aplicados (Feature Schema v6.0 + EDA Sección 6.4):
-          - eval_set != 'test'  (implementado también en data_ingestion.py)
+          - eval_set != 'test'
           - Usuarios con >= 5 órdenes en eval_set='prior'
-          - Usuarios con exactamente >= 1 orden en eval_set='train'
+          - Usuarios con >= 1 orden en eval_set='train'
           - Productos con >= 50 compras globales en prior
           - LIMIT N_USERS_APTOS = 10.000 usuarios aptos
+          - RANDOM_SEED fijado en PostgreSQL local antes del SELECT para reproducibilidad
         """
         self.pipeline_start_time = datetime.now()
 
         if not self.connect():
             return
 
+        # ── Fijar semilla en PostgreSQL local ──────────────────────────────────
+        # setseed() acepta un valor entre -1 y 1.
+        # RANDOM_SEED=42 → 42/100 = 0.42, dentro del rango válido.
+        # Esto garantiza que ORDER BY RANDOM() sea reproducible entre corridas.
+        seed_value = RANDOM_SEED / 100
+        seed_cursor = self.local_conn.cursor()
+        seed_cursor.execute(f"SELECT setseed({seed_value})")
+        seed_cursor.close()
+        self.local_conn.commit()
+        logging.info(f"Semilla fijada en PostgreSQL local: setseed({seed_value})")
+
         # ── 1. DIM_USER ────────────────────────────────────────────────────────
-        # Transformación: user_age → user_birthdate para independencia temporal.
-        # Filtro: >= 5 órdenes prior AND >= 1 orden train (usuarios aptos para el modelo).
+        # Conserva user_id original de Instacart como user_key.
+        # fact_order_products también usa user_id original → JOINs consistentes.
+        # Filtro: >= 5 órdenes prior AND >= 1 orden train (usuarios aptos).
+        # ORDER BY RANDOM() con semilla fija → selección reproducible.
         query_ext_user = f"""
             SELECT
                 u.user_id AS user_key,
@@ -317,16 +319,16 @@ class DimensionalETL:
         self.transfer_data(query_ext_user, 'dim_user', query_ins_user)
 
         # ── 2. DIM_PRODUCT ─────────────────────────────────────────────────────
-        # Transformación: desnormalización de productos, aisles y departamentos.
-        # Filtro: solo productos con >= 50 compras globales en prior (MIN_PRODUCT_ORDERS).
+        # Desnormalización de productos, aisles y departamentos.
+        # Filtro: solo productos con >= 50 compras globales en prior.
         query_ext_product = f"""
             SELECT
-                p.product_id AS product_key,
+                p.product_id   AS product_key,
                 p.product_name,
-                a.aisle     AS aisle_name,
-                d.department AS department_name
+                a.aisle        AS aisle_name,
+                d.department   AS department_name
             FROM Resources.products p
-            JOIN Resources.aisles      a ON p.aisle_id      = a.aisle_id
+            JOIN Resources.aisles        a ON p.aisle_id      = a.aisle_id
             JOIN Departments.departments d ON p.department_id = d.department_id
             WHERE p.product_id IN (
                 SELECT product_id
@@ -345,11 +347,10 @@ class DimensionalETL:
         self.transfer_data(query_ext_product, 'dim_product', query_ins_product)
 
         # ── 3. FACT_ORDER_PRODUCTS ─────────────────────────────────────────────
-        # Transformación: unión de prior + train con filtros de usuarios y productos aptos.
+        # Unión de prior + train con filtros de usuarios y productos aptos.
         # eval_set='test' excluido por el WHERE final.
-        # Usuarios aptos: los cargados en dim_user (JOIN actúa como filtro).
-        # Productos aptos: los cargados en dim_product (JOIN actúa como filtro).
-        # Obtener los user_keys ya cargados en Neon
+        # El JOIN con dim_user y dim_product actúa como filtro implícito —
+        # solo entran usuarios y productos que pasaron los filtros anteriores.
         neon_cursor = self.neon_conn.cursor()
         neon_cursor.execute('SELECT user_key FROM dim_user')
         loaded_users = tuple(row[0] for row in neon_cursor.fetchall())
@@ -370,23 +371,23 @@ class DimensionalETL:
                 HAVING COUNT(*) >= {MIN_PRODUCT_ORDERS}
             )
             SELECT
-                o.order_id                          AS order_key,
-                o.user_id                           AS user_key,
-                op.product_id                       AS product_key,
+                o.order_id                         AS order_key,
+                o.user_id                          AS user_key,
+                op.product_id                      AS product_key,
                 o.order_dow,
                 CAST(o.order_hour_of_day AS SMALLINT),
                 o.days_since_prior_order,
                 op.add_to_cart_order,
                 op.reordered,
                 o.order_number,
-                o.eval_set                          AS get_eval
+                o.eval_set                         AS get_eval
             FROM Orders_Schema.orders o
-            JOIN All_Orders      op  ON o.order_id   = op.order_id
-            JOIN Productos_Aptos pa  ON op.product_id = pa.product_id
+            JOIN All_Orders      op ON o.order_id    = op.order_id
+            JOIN Productos_Aptos pa ON op.product_id = pa.product_id
             WHERE o.eval_set IN ('prior', 'train')
             AND o.user_id IN {loaded_users};
         """
-        
+
         query_ins_fact = """
             INSERT INTO fact_order_products (
                 order_key, user_key, product_key, order_dow, order_hour_of_day,
@@ -398,9 +399,11 @@ class DimensionalETL:
         """
 
         self.transfer_data(query_ext_fact, 'fact_order_products', query_ins_fact, chunk_size=10_000)
+
         self.populate_dim_user()
         self.generate_report()
         self.close()
+
 
 if __name__ == "__main__":
     etl = DimensionalETL(LOCAL_DB_CONFIG, NEON_DB_CONFIG)
