@@ -324,21 +324,51 @@ def load_data_from_neon(
 
     return result
 
+# ─── Guardado a disco ─────────────────────────────────────────────────────────
+def save_data(
+    data: Dict[str, pd.DataFrame],
+    output_dir: str = 'data/raw',
+) -> None:
+    """
+    Guarda cada DataFrame del dict como parquet en output_dir.
+
+    Parameters
+    ----------
+    data : dict[str, pd.DataFrame]
+        Resultado de load_data_from_neon().
+    output_dir : str
+        Directorio de salida. Se crea si no existe.
+
+    Output
+    ------
+    data/raw/fact_order_products.parquet
+    data/raw/dim_user.parquet
+    data/raw/dim_product.parquet
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    for name, df in data.items():
+        path = os.path.join(output_dir, f'{name}.parquet')
+        df.to_parquet(path, index=False)
+        size_mb = os.path.getsize(path) / 1e6
+        logger.info(f"  Guardado: {path} ({size_mb:.1f} MB)")
+
 
 # ─── Entry point ──────────────────────────────────────────────────────────────
-# Permite correr el loader directamente desde terminal para verificar la conexión:
-# python data_loader.py --n_users 500
+# python -m src.data.data_loader
+# python -m src.data.data_loader --n_users 500
 if __name__ == '__main__':
     import argparse
 
     parser = argparse.ArgumentParser(description='Carga de datos desde Neon')
     parser.add_argument('--tables',  nargs='+', default=AVAILABLE_TABLES)
     parser.add_argument('--n_users', type=int,  default=None)
-    parser.add_argument('--limit',   type=int,  default=None)
+    parser.add_argument('--output',  type=str,  default='data/raw',
+                        help='Directorio de salida para los parquet (default: data/raw)')
     args = parser.parse_args()
 
     data = load_data_from_neon(tables=args.tables, n_users=args.n_users)
+    save_data(data, output_dir=args.output)
 
-    print("\nDataFrames cargados:")
+    print("\nDataFrames guardados:")
     for name, df in data.items():
         print(f"  {name:<25}: {df.shape[0]:>10,} filas × {df.shape[1]} cols")

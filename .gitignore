@@ -208,8 +208,9 @@ __marimo__/
 
 # Datos y modelos
 data/raw/
-data/processed/
 .env
+models
+
 # MLflow
 mlruns/
 #Ignora los csv

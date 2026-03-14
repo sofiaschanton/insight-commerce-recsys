@@ -902,11 +902,31 @@ def build_feature_matrix(
 
 
 # ─── Entry point ──────────────────────────────────────────────────────────────
+# Lee los parquet generados por data_loader y construye el feature matrix.
+# Paso previo obligatorio: python -m src.data.data_loader
+#
+# python -m src.features.feature_engineering
+# python -m src.features.feature_engineering --input data/raw --output data/processed/feature_matrix.parquet
 if __name__ == '__main__':
-    from src.data.data_loader import load_data_from_neon
+    import argparse
 
-    data   = load_data_from_neon()
-    matrix = build_feature_matrix(data)
+    parser = argparse.ArgumentParser(description='Feature engineering desde parquet locales')
+    parser.add_argument('--input',  type=str, default='data/raw',
+                        help='Directorio con los parquet de data_loader (default: data/raw)')
+    parser.add_argument('--output', type=str, default='data/processed/feature_matrix.parquet',
+                        help='Ruta de salida del feature matrix (default: data/processed/feature_matrix.parquet)')
+    args = parser.parse_args()
+
+    input_dir = args.input
+    data = {
+        'fact_order_products': pd.read_parquet(f'{input_dir}/fact_order_products.parquet'),
+        'dim_product':         pd.read_parquet(f'{input_dir}/dim_product.parquet'),
+    }
+    logger.info(f"Datos leídos desde {input_dir}/")
+    for name, df in data.items():
+        logger.info(f"  {name}: {len(df):,} filas")
+
+    matrix = build_feature_matrix(data, output_path=args.output)
 
     print("\nFeature matrix generada:")
     print(f"  Shape   : {matrix.shape}")
