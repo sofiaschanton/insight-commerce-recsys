@@ -208,10 +208,17 @@ __marimo__/
 
 # Datos y modelos
 data/raw/
+data/processed/
+/models/
 .env
 models
 
 # MLflow
 mlruns/
 #Ignora los csv
+*.csv
+
+/mlartifacts
+notebooks/catboost_info
+mlflow.db
 *.csv

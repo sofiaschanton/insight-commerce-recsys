@@ -38,7 +38,7 @@ if not logger.handlers:
 # Cargamos las variables de entorno desde .env
 # Las credenciales de Neon deben estar definidas como:
 # NEON_USER, NEON_PASSWORD, NEON_HOST, NEON_PORT, NEON_DATABASE
-load_dotenv('.env')
+load_dotenv(dotenv_path='/home/asus_juan/Documents/GitHub/insight-commerce-recsys/.env')
 
 def _build_db_url() -> str:
     """

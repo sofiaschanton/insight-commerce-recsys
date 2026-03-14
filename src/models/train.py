@@ -19,6 +19,8 @@ Flujo:
         |
         4. LightGBM optimizado          (fit en train, eval en val)
         |
+        5. Guardado MLFlow              (Guardado en MLFlow los resultados)
+        |
         5. Evaluacion en test
         |
         6. Serializacion
@@ -46,6 +48,8 @@ import time
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, Tuple
+import mlflow
+import mlflow.lightgbm
 
 import joblib
 import numpy as np
@@ -331,7 +335,6 @@ def run_optuna(
 
 
 # ── Entrenamiento principal ───────────────────────────────────────────────────
-
 def train(
     parquet_path: Path  = FEATURE_MATRIX_PATH,
     models_dir: Path    = MODELS_DIR,
@@ -341,6 +344,7 @@ def train(
 ) -> Dict[str, Any]:
     """
     Flujo completo de entrenamiento.
+    Guardado de Resultados en MLFlow
 
     Parameters
     ----------
@@ -362,6 +366,10 @@ def train(
     """
     start = time.time()
     models_dir.mkdir(parents=True, exist_ok=True)
+    
+    # ── NUEVO: Configuración inicial de MLflow ────────────────────────────────
+    mlflow.set_tracking_uri("http://127.0.0.1:5000") # Direccion de MLFlow
+    mlflow.set_experiment("Next_Basket_Recommendation") # Nombre de la Bitacora de MLFlow
 
     logger.info("=" * 60)
     logger.info("Iniciando train.py")
@@ -371,123 +379,142 @@ def train(
     logger.info(f"  random_state     : {random_state}")
     logger.info("=" * 60)
 
-    # ── 1. Cargar ─────────────────────────────────────────────────────────────
-    matrix = load_matrix(parquet_path)
+    # Con esto podemos crear un RUN en MLFlow para guardar las mejores metricas que se guardaron en el modelo
+    # MLFlow es como una bitacora para evaluar cual es el mejor modelo en uno u otro caso
+    with mlflow.start_run(run_name="lgbm_kmeans_pipeline"):
 
-    label_dist       = matrix[LABEL_COL].value_counts()
-    scale_pos_weight = float(label_dist[0] / max(label_dist[1], 1))
-    logger.info(
-        f"Balance -- label=0: {label_dist[0]:,} | label=1: {label_dist[1]:,} | "
-        f"scale_pos_weight: {scale_pos_weight:.2f}"
-    )
+        # Registrar parámetros globales del pipeline
+        mlflow.log_param("random_state", random_state)
+        mlflow.log_param("usa_optuna", run_optuna_flag)
+        mlflow.log_param("optuna_trials", n_optuna_trials)
+        mlflow.log_param("n_clusters_user", N_CLUSTERS_USER)
+        mlflow.log_param("n_clusters_product", N_CLUSTERS_PRODUCT)
 
-    # ── 2. Split por usuarios ─────────────────────────────────────────────────
-    train_df, val_df, test_df = split_by_users(matrix, random_state)
+        # ── 1. Cargar ─────────────────────────────────────────────────────────────
+        matrix = load_matrix(parquet_path)
 
-    # ── 3. K-Means (fit solo en train) ────────────────────────────────────────
-    train_df, val_df, test_df, cluster_models = fit_kmeans(
-        train_df, val_df, test_df, random_state
-    )
-
-    # ── 4. Separar X e y ──────────────────────────────────────────────────────
-    X_train, y_train, X_val, y_val, X_test, y_test, feature_cols = get_Xy(
-        train_df, val_df, test_df
-    )
-    lgbm_cat = [c for c in LGBM_CAT_FEATURES if c in feature_cols]
-
-    # ── 5. Hiperparametros ────────────────────────────────────────────────────
-    if run_optuna_flag:
-        best_params = run_optuna(
-            X_train, y_train, X_val, y_val,
-            scale_pos_weight, lgbm_cat, n_optuna_trials, random_state,
+        label_dist       = matrix[LABEL_COL].value_counts()
+        scale_pos_weight = float(label_dist[0] / max(label_dist[1], 1))
+        logger.info(
+            f"Balance -- label=0: {label_dist[0]:,} | label=1: {label_dist[1]:,} | "
+            f"scale_pos_weight: {scale_pos_weight:.2f}"
         )
-    else:
-        logger.info("Optuna omitido -- usando hiperparametros por defecto")
-        best_params = {
-            "n_estimators"    : 500,
-            "learning_rate"   : 0.05,
-            "num_leaves"      : 63,
-            "scale_pos_weight": scale_pos_weight,
-            "random_state"    : random_state,
-            "n_jobs"          : -1,
-            "verbose"         : -1,
+
+        # ── 2. Split por usuarios ─────────────────────────────────────────────────
+        train_df, val_df, test_df = split_by_users(matrix, random_state)
+
+        # ── 3. K-Means (fit solo en train) ────────────────────────────────────────
+        train_df, val_df, test_df, cluster_models = fit_kmeans(
+            train_df, val_df, test_df, random_state
+        )
+
+        # ── 4. Separar X e y ──────────────────────────────────────────────────────
+        X_train, y_train, X_val, y_val, X_test, y_test, feature_cols = get_Xy(
+            train_df, val_df, test_df
+        )
+        lgbm_cat = [c for c in LGBM_CAT_FEATURES if c in feature_cols]
+
+        # ── 5. Hiperparametros ────────────────────────────────────────────────────
+        if run_optuna_flag:
+            best_params = run_optuna(
+                X_train, y_train, X_val, y_val,
+                scale_pos_weight, lgbm_cat, n_optuna_trials, random_state,
+            )
+        else:
+            logger.info("Optuna omitido -- usando hiperparametros por defecto")
+            best_params = {
+                "n_estimators"    : 500,
+                "learning_rate"   : 0.05,
+                "num_leaves"      : 63,
+                "scale_pos_weight": scale_pos_weight,
+                "random_state"    : random_state,
+                "n_jobs"          : -1,
+                "verbose"         : -1,
+            }
+        
+        mlflow.log_params(best_params) # Guardamos los logs con las mejores metricas
+
+        # ── 6. Entrenar modelo final ───────────────────────────────────────────────
+        logger.info("Entrenando LightGBM con mejores parametros...")
+        model = lgb.LGBMClassifier(**best_params)
+        model.fit(
+            X_train, y_train,
+            eval_set            = [(X_val, y_val)],
+            categorical_feature = lgbm_cat,
+            callbacks           = [
+                lgb.early_stopping(50, verbose=False),
+                lgb.log_evaluation(100),
+            ],
+        )
+        logger.info(f"  Best iteration: {model.best_iteration_}")
+
+        # ── 7. Evaluar en test ────────────────────────────────────────────────────
+        y_pred  = model.predict(X_test)
+        y_proba = model.predict_proba(X_test)[:, 1]
+        metrics = eval_metrics(y_test, y_pred, y_proba)
+
+        mlflow.log_metrics(metrics)
+
+        logger.info("-" * 60)
+        logger.info("Metricas en test:")
+        logger.info(f"  Precision : {metrics['precision']:.4f}")
+        logger.info(f"  Recall    : {metrics['recall']:.4f}")
+        logger.info(f"  F1        : {metrics['f1']:.4f}")
+        logger.info(f"  AUC-ROC   : {metrics['auc']:.4f}")
+        logger.info("-" * 60)
+
+        # ── 8. Feature importance ─────────────────────────────────────────────────
+        importance = pd.DataFrame({
+            "feature"   : feature_cols,
+            "importance": model.feature_importances_,
+        }).sort_values("importance", ascending=False)
+
+        zero_imp = importance[importance["importance"] == 0]["feature"].tolist()
+        if zero_imp:
+            logger.info(f"  Features con importance=0 ({len(zero_imp)}): {zero_imp}")
+
+        # ── 9. Serializar ─────────────────────────────────────────────────────────
+        model_path        = models_dir / "model.pkl"
+        cluster_path      = models_dir / "cluster_models.pkl"
+        log_path          = models_dir / "model_log.json"
+
+        joblib.dump(model,          model_path)
+        joblib.dump(cluster_models, cluster_path)
+
+        log = {
+            "timestamp"        : datetime.now().isoformat(),
+            "model_name"       : "LightGBM optimizado",
+            "model_path"       : str(model_path),
+            "random_seed"      : random_state,
+            "scale_pos_weight" : scale_pos_weight,
+            "n_features"       : len(feature_cols),
+            "feature_cols"     : feature_cols,
+            "cat_features_lgbm": lgbm_cat,
+            "split": {
+                "method"      : "by_users_70_15_15",
+                "n_train_users": int(matrix["user_key"].nunique() * 0.70),
+                "n_val_users"  : int(matrix["user_key"].nunique() * 0.15),
+                "n_test_users" : int(matrix["user_key"].nunique() * 0.15),
+                "n_train_pairs": len(train_df),
+                "n_val_pairs"  : len(val_df),
+                "n_test_pairs" : len(test_df),
+            },
+            "metrics_test"     : metrics,
+            "best_params"      : {
+                k: (float(v) if isinstance(v, (float, np.floating)) else v)
+                for k, v in best_params.items()
+            },
+            "importance_top10" : importance.head(10)[["feature", "importance"]].assign(
+                importance=lambda x: x["importance"].astype(int)
+            ).to_dict("records"),
+            "features_zero_importance": zero_imp,
         }
+        with open(log_path, "w", encoding="utf-8") as f:
+            json.dump(log, f, indent=2, ensure_ascii=False)
 
-    # ── 6. Entrenar modelo final ───────────────────────────────────────────────
-    logger.info("Entrenando LightGBM con mejores parametros...")
-    model = lgb.LGBMClassifier(**best_params)
-    model.fit(
-        X_train, y_train,
-        eval_set            = [(X_val, y_val)],
-        categorical_feature = lgbm_cat,
-        callbacks           = [
-            lgb.early_stopping(50, verbose=False),
-            lgb.log_evaluation(100),
-        ],
-    )
-    logger.info(f"  Best iteration: {model.best_iteration_}")
-
-    # ── 7. Evaluar en test ────────────────────────────────────────────────────
-    y_pred  = model.predict(X_test)
-    y_proba = model.predict_proba(X_test)[:, 1]
-    metrics = eval_metrics(y_test, y_pred, y_proba)
-
-    logger.info("-" * 60)
-    logger.info("Metricas en test:")
-    logger.info(f"  Precision : {metrics['precision']:.4f}")
-    logger.info(f"  Recall    : {metrics['recall']:.4f}")
-    logger.info(f"  F1        : {metrics['f1']:.4f}")
-    logger.info(f"  AUC-ROC   : {metrics['auc']:.4f}")
-    logger.info("-" * 60)
-
-    # ── 8. Feature importance ─────────────────────────────────────────────────
-    importance = pd.DataFrame({
-        "feature"   : feature_cols,
-        "importance": model.feature_importances_,
-    }).sort_values("importance", ascending=False)
-
-    zero_imp = importance[importance["importance"] == 0]["feature"].tolist()
-    if zero_imp:
-        logger.info(f"  Features con importance=0 ({len(zero_imp)}): {zero_imp}")
-
-    # ── 9. Serializar ─────────────────────────────────────────────────────────
-    model_path        = models_dir / "model.pkl"
-    cluster_path      = models_dir / "cluster_models.pkl"
-    log_path          = models_dir / "model_log.json"
-
-    joblib.dump(model,          model_path)
-    joblib.dump(cluster_models, cluster_path)
-
-    log = {
-        "timestamp"        : datetime.now().isoformat(),
-        "model_name"       : "LightGBM optimizado",
-        "model_path"       : str(model_path),
-        "random_seed"      : random_state,
-        "scale_pos_weight" : scale_pos_weight,
-        "n_features"       : len(feature_cols),
-        "feature_cols"     : feature_cols,
-        "cat_features_lgbm": lgbm_cat,
-        "split": {
-            "method"      : "by_users_70_15_15",
-            "n_train_users": int(matrix["user_key"].nunique() * 0.70),
-            "n_val_users"  : int(matrix["user_key"].nunique() * 0.15),
-            "n_test_users" : int(matrix["user_key"].nunique() * 0.15),
-            "n_train_pairs": len(train_df),
-            "n_val_pairs"  : len(val_df),
-            "n_test_pairs" : len(test_df),
-        },
-        "metrics_test"     : metrics,
-        "best_params"      : {
-            k: (float(v) if isinstance(v, (float, np.floating)) else v)
-            for k, v in best_params.items()
-        },
-        "importance_top10" : importance.head(10)[["feature", "importance"]].assign(
-            importance=lambda x: x["importance"].astype(int)
-        ).to_dict("records"),
-        "features_zero_importance": zero_imp,
-    }
-    with open(log_path, "w", encoding="utf-8") as f:
-        json.dump(log, f, indent=2, ensure_ascii=False)
+        mlflow.lightgbm.log_model(model, artifact_path="lightgbm_model") # Nombre del modelo lightGBM que se uso y en path donde se guarda en MLFlow
+        mlflow.log_artifact(local_path=str(cluster_path), artifact_path="cluster_models") 
+        mlflow.log_artifact(local_path=str(log_path), artifact_path="logs")
 
     elapsed = time.time() - start
     logger.info("=" * 60)
@@ -505,7 +532,6 @@ def train(
         "best_params"   : best_params,
         "importance"    : importance,
     }
-
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
