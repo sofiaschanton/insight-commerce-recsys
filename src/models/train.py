@@ -484,11 +484,35 @@ def train(
         if zero_imp:
             logger.info(f"  Features con importance=0 ({len(zero_imp)}): {zero_imp}")
 
-        # ── 9. Serializar ─────────────────────────────────────────────────────────
+        # ── 9. Rollback check ─────────────────────────────────────────────────────
+        # Si el F1 nuevo es más de 5% inferior al F1 del modelo anterior,
+        # no sobreescribir los artefactos y salir con error claro.
         model_path        = models_dir / "model.pkl"
         cluster_path      = models_dir / "cluster_models.pkl"
         log_path          = models_dir / "model_log.json"
 
+        if log_path.exists():
+            try:
+                with open(log_path, encoding="utf-8") as _f:
+                    old_log = json.load(_f)
+                old_f1 = float(old_log.get("metrics_test", {}).get("f1", 0.0))
+                new_f1 = metrics["f1"]
+                if old_f1 > 0 and new_f1 < old_f1 * 0.95:
+                    logger.warning("=" * 60)
+                    logger.warning("ROLLBACK ACTIVADO — los artefactos NO serán sobreescritos.")
+                    logger.warning(f"  F1 anterior : {old_f1:.4f}")
+                    logger.warning(f"  F1 nuevo    : {new_f1:.4f}  (degradación > 5%)")
+                    logger.warning(f"  Umbral      : {old_f1 * 0.95:.4f}  (F1_anterior x 0.95)")
+                    logger.warning("=" * 60)
+                    raise RuntimeError(
+                        f"Rollback: F1 nuevo ({new_f1:.4f}) es más de 5% inferior al F1 anterior "
+                        f"({old_f1:.4f}). Umbral mínimo: {old_f1 * 0.95:.4f}. "
+                        "Los artefactos del modelo anterior NO fueron sobreescritos."
+                    )
+            except (json.JSONDecodeError, KeyError) as _e:
+                logger.warning(f"No se pudo leer model_log.json para rollback check: {_e}. Continuando.")
+
+        # ── 10. Serializar ────────────────────────────────────────────────────────
         joblib.dump(model,          model_path)
         joblib.dump(cluster_models, cluster_path)
 

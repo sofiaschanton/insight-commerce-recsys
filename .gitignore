@@ -209,9 +209,11 @@ __marimo__/
 # Datos y modelos
 data/raw/
 data/processed/
-/models/
+models/*.pkl
+models/*.json
+models/*.parquet
+
 .env
-models
 
 # MLflow
 mlruns/
@@ -222,3 +224,6 @@ mlruns/
 notebooks/catboost_info
 mlflow.db
 *.csv
+
+# Reports generados localmente
+reports/data/

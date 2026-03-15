@@ -128,6 +128,43 @@ MIN_PRODUCT_ORDERS = 50   # productos con menos compras tienen tasas de reorden 
 SEGMENT_BINS  = [0, 5, 10, 20, 40, 101]
 SEGMENT_CODES = [1, 2, 3, 4, 5]
 
+# ─── Contrato de columnas del feature matrix ──────────────────────────────────
+# Lista canónica de las 26 columnas del feature matrix, en orden de salida.
+# Importada por validate_data.py y test_data_loader.py para no hardcodear nombres.
+FEATURE_MATRIX_COLUMNS = [
+    # IDs
+    'user_key', 'product_key',
+    # Usuario — base (3) + extensiones (3)
+    'user_total_orders', 'user_avg_basket_size', 'user_days_since_last_order',
+    'user_reorder_ratio', 'user_distinct_products', 'user_segment_code',
+    # Producto — base (2) + extensiones (4)
+    'product_total_purchases', 'product_reorder_rate',
+    'product_avg_add_to_cart', 'product_unique_users',
+    'p_department_reorder_rate', 'p_aisle_reorder_rate',
+    # Interacción u×p — base (6) + extensiones (4)
+    'up_times_purchased', 'up_reorder_rate',
+    'up_orders_since_last_purchase', 'up_first_order_number', 'up_last_order_number',
+    'up_avg_add_to_cart_order',
+    'up_days_since_last', 'up_avg_days_between_orders', 'up_delta_days',
+    'u_favorite_department', 'u_favorite_aisle',
+    # Label
+    'label',
+]
+
+# Columnas con NaN intencionales — LightGBM y CatBoost los manejan de forma nativa.
+NAN_INTENCIONALES = {
+    "up_avg_days_between_orders",
+    "up_delta_days",
+}
+
+# Estas columnas NO deben imputarse; sus NaN tienen significado semántico.
+NULLABLE_COLUMNS = [
+    'p_department_reorder_rate',   # NaN si dim_product no tiene department_key
+    'p_aisle_reorder_rate',        # NaN si dim_product no tiene aisle_key
+    'up_avg_days_between_orders',  # NaN cuando up_times_purchased == 1
+    'up_delta_days',               # NaN donde up_avg_days_between_orders es NaN
+]
+
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -811,28 +848,9 @@ def build_feature_matrix(
     logger.info("─" * 60)
 
     # ── 6. Orden de columnas ──────────────────────────────────────────────────
-    # Orden explícito para que el parquet sea legible y reproducible.
+    # Usa FEATURE_MATRIX_COLUMNS (definida al nivel del módulo) como contrato canónico.
     # Las columnas ausentes (si una feature falló) se omiten silenciosamente.
-    COLUMN_ORDER = [
-        # IDs
-        'user_key', 'product_key',
-        # Usuario — base (3) + extensiones (3)
-        'user_total_orders', 'user_avg_basket_size', 'user_days_since_last_order',
-        'user_reorder_ratio', 'user_distinct_products', 'user_segment_code',
-        # Producto — base (2) + extensiones (5)
-        'product_total_purchases', 'product_reorder_rate',
-        'product_avg_add_to_cart', 'product_unique_users',
-        'p_department_reorder_rate', 'p_aisle_reorder_rate',
-        # Interacción u×p — base (6) + extensiones (4)
-        'up_times_purchased', 'up_reorder_rate',
-        'up_orders_since_last_purchase', 'up_first_order_number', 'up_last_order_number',
-        'up_avg_add_to_cart_order',
-        'up_days_since_last', 'up_avg_days_between_orders', 'up_delta_days',
-        'u_favorite_department', 'u_favorite_aisle',
-        # Label
-        'label',
-    ]
-    df = df[[c for c in COLUMN_ORDER if c in df.columns]]
+    df = df[[c for c in FEATURE_MATRIX_COLUMNS if c in df.columns]]
 
     # ── 7. Validaciones finales ───────────────────────────────────────────────
 
@@ -850,13 +868,7 @@ def build_feature_matrix(
                 logger.info(f"  fillna(0) en {col}: {n:,} nulos — {razon}")
 
     # Columnas con NaN intencionales — manejados de forma nativa por LightGBM y CatBoost
-    NAN_INTENCIONALES = [
-        'p_department_reorder_rate',
-        'p_aisle_reorder_rate',
-        'up_avg_days_between_orders',
-        'up_delta_days',
-    ]
-    nan_report = {col: int(df[col].isna().sum()) for col in NAN_INTENCIONALES if col in df.columns}
+    nan_report = {col: int(df[col].isna().sum()) for col in NULLABLE_COLUMNS if col in df.columns}
     nan_con_nulos = {col: n for col, n in nan_report.items() if n > 0}
     if nan_con_nulos:
         logger.info("  Columnas con NaN intencionales — manejados por LightGBM/CatBoost:")
