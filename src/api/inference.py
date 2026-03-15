@@ -2,7 +2,7 @@ import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List
+from typing import Any, Dict, List
 
 import joblib
 import numpy as np
@@ -51,7 +51,7 @@ class LoadedArtifacts:
     """Contenedor para los tres artefactos que se cargan al iniciar el servicio."""
     model: object           # Modelo LightGBM entrenado
     cluster_models: Dict[str, object]  # Scalers y KMeans para clusters de usuario y producto
-    model_log: Dict[str, object]       # Metadatos del modelo: feature_cols, n_features, AUC, etc.
+    model_log: Dict[str, Any]       # Metadatos del modelo: feature_cols, n_features, AUC, etc.
 
 
 class RecommendationService:
