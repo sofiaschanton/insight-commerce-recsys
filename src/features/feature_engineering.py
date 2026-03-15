@@ -11,7 +11,7 @@ calcular features desde prior y construir el label desde train.
 
 Flujo de datos
 --------------
-    load_data_from_neon()  →  dict[str, pd.DataFrame]
+    load_data_from_aws()  →  dict[str, pd.DataFrame]
             ↓  [este módulo]
     data/processed/feature_matrix.parquet   ← tiene NaN intencionales
             ↓  [train.py]
@@ -79,10 +79,10 @@ Filtros aplicados
 
 Uso
 ---
-    from src.data.data_loader import load_data_from_neon
+    from src.data.data_loader import load_data_from_aws
     from src.features.feature_engineering import build_feature_matrix
 
-    data   = load_data_from_neon()
+    data   = load_data_from_aws()
     matrix = build_feature_matrix(data)
     # → guarda feature_matrix.parquet con NaN intencionales
     # → siguiente paso: train.py
@@ -250,10 +250,10 @@ def get_user_features(
 
 
 # ─── Normalización de dim_product ────────────────────────────────────────────
-# Neon guarda department_name y aisle_name como strings en dim_product,
+# AWS RDS guarda department_name y aisle_name como strings en dim_product,
 # sin columnas de clave numérica separadas. Esta función genera department_key
 # y aisle_key automáticamente usando category codes, para que el resto del
-# pipeline no dependa del formato exacto de Neon.
+# pipeline no dependa del formato exacto de AWS RDS.
 #
 # Decisión de diseño: usamos cat.codes en vez de un mapeo fijo porque el
 # dataset de Instacart tiene IDs estables y no necesitamos consistencia
