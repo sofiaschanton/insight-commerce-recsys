@@ -100,12 +100,12 @@ class RecommendationService:
         Ajusta automáticamente el modo SSL: si el host es local (localhost/127.0.0.1)
         y se pide SSL estricto, lo baja a 'prefer' para evitar errores de conexión.
         """
-        host = (os.getenv("NEON_HOST") or "").strip()
-        sslmode = (os.getenv("NEON_SSLMODE", "require") or "require").strip().lower()
+        host = (os.getenv("AWS_HOST") or "").strip()
+        sslmode = (os.getenv("AWS_SSLMODE", "require") or "require").strip().lower()
 
         if not host:
             raise DatabaseConnectionError(
-                "NEON_HOST no está configurado. Definilo en .env antes de iniciar la API."
+                "AWS_HOST no está configurado. Definilo en .env antes de iniciar la API."
             )
 
         # Si el host es local, SSL estricto no es compatible → bajamos a 'prefer'
@@ -125,11 +125,11 @@ class RecommendationService:
 
         db_url = URL.create(
             drivername="postgresql+psycopg2",
-            username=os.getenv("NEON_USER"),
-            password=os.getenv("NEON_PASSWORD"),
+            username=os.getenv("AWS_USER"),
+            password=os.getenv("AWS_PASSWORD"),
             host=host,
-            port=os.getenv("NEON_PORT", "5432"),
-            database=os.getenv("NEON_DATABASE"),
+            port=os.getenv("AWS_PORT", "5432"),
+            database=os.getenv("AWS_DATABASE"),
         )
         return create_engine(
             db_url,
@@ -150,7 +150,7 @@ class RecommendationService:
             # Mensaje adicional para usuarios con Postgres local
             hint = ""
             if self._db_host.lower() in {"localhost", "127.0.0.1", "::1"}:
-                hint = " Para Postgres local, usá NEON_SSLMODE=disable o prefer en .env."
+                hint = " Para Postgres local, usá AWS_SSLMODE=disable o prefer en .env."
 
             raise DatabaseConnectionError(
                 f"No se pudo conectar a PostgreSQL (host={self._db_host}, sslmode={self._db_sslmode}).{hint}"

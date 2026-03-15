@@ -47,10 +47,9 @@ import os
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Any, Tuple
+from typing import Dict, Any, Optional, Tuple
 import mlflow
 import mlflow.lightgbm
-
 import joblib
 import numpy as np
 import pandas as pd
@@ -336,11 +335,12 @@ def run_optuna(
 
 # ── Entrenamiento principal ───────────────────────────────────────────────────
 def train(
-    parquet_path: Path  = FEATURE_MATRIX_PATH,
-    models_dir: Path    = MODELS_DIR,
-    n_optuna_trials: int = N_OPTUNA_TRIALS,
-    run_optuna_flag: bool = True,
-    random_state: int   = 42,
+    parquet_path: Path           = FEATURE_MATRIX_PATH,
+    models_dir: Path             = MODELS_DIR,
+    n_optuna_trials: int         = N_OPTUNA_TRIALS,
+    run_optuna_flag: bool        = True,
+    random_state: int            = 42,
+    matrix: Optional[pd.DataFrame] = None,
 ) -> Dict[str, Any]:
     """
     Flujo completo de entrenamiento.
@@ -350,6 +350,7 @@ def train(
     ----------
     parquet_path : Path
         Ruta al feature_matrix.parquet generado por pipeline.py.
+        Solo se usa cuando matrix=None.
     models_dir : Path
         Directorio donde se guardan model.pkl, cluster_models.pkl y model_log.json.
     n_optuna_trials : int
@@ -358,18 +359,23 @@ def train(
         Si False, usa hiperparametros por defecto sin Optuna.
     random_state : int
         Semilla global. Default: 42.
+    matrix : pd.DataFrame | None
+        Feature matrix precalculada. Si se pasa, omite la lectura del parquet.
+        Permite encadenar con pipeline.py sin escribir a disco.
 
     Returns
     -------
     dict
         Artefactos: modelo, cluster_models, feature_cols, metrics, best_params.
     """
+    tracking_uri = os.getenv("MLFLOW_TRACKING_URI", "").strip()
+    if tracking_uri:
+        mlflow.set_tracking_uri(tracking_uri)
+
     start = time.time()
     models_dir.mkdir(parents=True, exist_ok=True)
     
-    # ── NUEVO: Configuración inicial de MLflow ────────────────────────────────
-    mlflow.set_tracking_uri("http://127.0.0.1:5000") # Direccion de MLFlow
-    mlflow.set_experiment("Next_Basket_Recommendation") # Nombre de la Bitacora de MLFlow
+    mlflow.set_experiment("Next_Basket_Recommendation")
 
     logger.info("=" * 60)
     logger.info("Iniciando train.py")
@@ -391,7 +397,12 @@ def train(
         mlflow.log_param("n_clusters_product", N_CLUSTERS_PRODUCT)
 
         # ── 1. Cargar ─────────────────────────────────────────────────────────────
-        matrix = load_matrix(parquet_path)
+        if matrix is None:
+            matrix = load_matrix(parquet_path)
+        else:
+            logger.info(
+                f"Feature matrix recibida en memoria: {matrix.shape[0]:,} filas x {matrix.shape[1]} cols"
+            )
 
         label_dist       = matrix[LABEL_COL].value_counts()
         scale_pos_weight = float(label_dist[0] / max(label_dist[1], 1))
