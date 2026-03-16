@@ -36,27 +36,27 @@ if not logger.handlers:
 
 # ─── Env ──────────────────────────────────────────────────────────────────────
 # Cargamos las variables de entorno desde .env
-# Las credenciales de Neon deben estar definidas como:
-# NEON_USER, NEON_PASSWORD, NEON_HOST, NEON_PORT, NEON_DATABASE
-load_dotenv(dotenv_path='/home/asus_juan/Documents/GitHub/insight-commerce-recsys/.env')
+# Las credenciales de AWS RDS deben estar definidas como:
+# AWS_USER, AWS_PASSWORD, AWS_HOST, AWS_PORT, AWS_DATABASE
+load_dotenv()
 
 def _build_db_url() -> str:
     """
-    Construye la URL de conexión a Neon usando las variables de entorno.
+    Construye la URL de conexión a AWS RDS usando las variables de entorno.
     Usamos URL.create() en lugar de f-string para manejar correctamente
     caracteres especiales en la contraseña (ej: @, #, %).
     """
     return URL.create(
         drivername = 'postgresql+psycopg2',
-        username   = os.getenv('NEON_USER'),
-        password   = os.getenv('NEON_PASSWORD'),
-        host       = os.getenv('NEON_HOST'),
-        port       = os.getenv('NEON_PORT'),
-        database   = os.getenv('NEON_DATABASE'),
+        username   = os.getenv('AWS_USER'),
+        password   = os.getenv('AWS_PASSWORD'),
+        host       = os.getenv('AWS_HOST'),
+        port       = os.getenv('AWS_PORT'),
+        database   = os.getenv('AWS_DATABASE'),
     )
 
 # ─── Configuración de tablas ──────────────────────────────────────────────────
-# Tablas disponibles en el schema dimensional de Neon
+# Tablas disponibles en el schema dimensional de AWS RDS
 AVAILABLE_TABLES = ['fact_order_products', 'dim_user', 'dim_product']
 
 # _TABLE_CONFIG define por cada tabla:
@@ -90,7 +90,7 @@ _TABLE_CONFIG: Dict[str, dict] = {
 }
 
 
-def load_data_from_neon(
+def load_data_from_aws(
     tables: List[str] = AVAILABLE_TABLES,
     esquemas: Optional[List[str]] = None,
     n_users: Optional[int] = None,
@@ -99,7 +99,7 @@ def load_data_from_neon(
     random_state: int = 42,
 ) -> Dict[str, pd.DataFrame]:
     """
-    Extrae datos desde Neon (schema dimensional) en una sola carga.
+    Extrae datos desde AWS RDS (schema dimensional) en una sola carga.
 
     Parameters
     ----------
@@ -116,8 +116,8 @@ def load_data_from_neon(
         Rango ('YYYY-MM-DD', 'YYYY-MM-DD') para extracción incremental.
         Filtra por order_number como proxy temporal y propaga el filtro a dim_user.
     connection_config : dict | None
-        Credenciales externas. Claves: 'NEON_HOST', 'NEON_DATABASE', 'NEON_USER',
-        'NEON_PASSWORD', 'NEON_PORT'. None = usa .env.
+        Credenciales externas. Claves: 'AWS_HOST', 'AWS_DATABASE', 'AWS_USER',
+        'AWS_PASSWORD', 'AWS_PORT'. None = usa .env.
     random_state : int
         Semilla para el sampleo. Default: 42.
 
@@ -128,36 +128,36 @@ def load_data_from_neon(
     Examples
     --------
     # Carga completa
-    >>> data = load_data_from_neon()
+    >>> data = load_data_from_aws()
 
     # Prueba rápida con 500 usuarios
-    >>> data = load_data_from_neon(
+    >>> data = load_data_from_aws(
     ...     tables=['fact_order_products', 'dim_user'],
     ...     n_users=500,
     ... )
 
     # Con filtro de fechas
-    >>> data = load_data_from_neon(
+    >>> data = load_data_from_aws(
     ...     tables=['fact_order_products', 'dim_user'],
     ...     n_users=1000,
     ...     date_range=('2017-01-01', '2017-06-30'),
     ... )
 
     # Esquemas custom
-    >>> data = load_data_from_neon(
+    >>> data = load_data_from_aws(
     ...     tables=['fact_order_products', 'dim_user'],
     ...     esquemas=['public', 'public'],
     ... )
 
     # Credenciales externas (sin .env)
-    >>> data = load_data_from_neon(
+    >>> data = load_data_from_aws(
     ...     tables=['fact_order_products'],
     ...     connection_config={
-    ...         'NEON_HOST': 'neon_host',
-    ...         'NEON_USER': 'postgres.xxxxx',
-    ...         'NEON_PASSWORD': 'secret',
-    ...         'NEON_DATABASE': 'neon_database',
-    ...         'NEON_PORT': '5432',
+    ...         'AWS_HOST': 'aws_host',
+    ...         'AWS_USER': 'postgres',
+    ...         'AWS_PASSWORD': 'secret',
+    ...         'AWS_DATABASE': 'aws_database',
+    ...         'AWS_PORT': '5432',
     ...     }
     ... )
     """
@@ -166,18 +166,18 @@ def load_data_from_neon(
     # sino se usa _build_db_url() que lee del .env
     if connection_config:
         db_url = (
-            f"postgresql+psycopg2://{connection_config.get('NEON_USER')}"
-            f":{connection_config.get('NEON_PASSWORD')}"
-            f"@{connection_config.get('NEON_HOST')}"
-            f":{connection_config.get('NEON_PORT', '5432')}"
-            f"/{connection_config.get('NEON_DATABASE', 'postgres')}"
+            f"postgresql+psycopg2://{connection_config.get('AWS_USER')}"
+            f":{connection_config.get('AWS_PASSWORD')}"
+            f"@{connection_config.get('AWS_HOST')}"
+            f":{connection_config.get('AWS_PORT', '5432')}"
+            f"/{connection_config.get('AWS_DATABASE', 'postgres')}"
         )
         logger.info("Usando connection_config externo")
     else:
         db_url = _build_db_url()
 
     t0 = time.perf_counter()
-    # sslmode=require es obligatorio en Neon (conexión encriptada)
+    # sslmode=require es obligatorio en AWS RDS (conexión encriptada)
     # pool_pre_ping=True verifica la conexión antes de cada query para evitar conexiones muertas
     engine = create_engine(db_url, connect_args={"connect_timeout": 10, "sslmode": "require"}, pool_pre_ping=True)
     load_log = []  # registro interno para el resumen final
@@ -213,7 +213,7 @@ def load_data_from_neon(
             })
 
     logger.info(
-        f"load_data_from_neon — tables={tables} | "
+        f"load_data_from_aws — tables={tables} | "
         f"n_users={n_users} | date_range={date_range}"
     )
 
@@ -335,7 +335,7 @@ def save_data(
     Parameters
     ----------
     data : dict[str, pd.DataFrame]
-        Resultado de load_data_from_neon().
+        Resultado de load_data_from_aws().
     output_dir : str
         Directorio de salida. Se crea si no existe.
 
@@ -359,14 +359,14 @@ def save_data(
 if __name__ == '__main__':
     import argparse
 
-    parser = argparse.ArgumentParser(description='Carga de datos desde Neon')
+    parser = argparse.ArgumentParser(description='Carga de datos desde AWS RDS')
     parser.add_argument('--tables',  nargs='+', default=AVAILABLE_TABLES)
     parser.add_argument('--n_users', type=int,  default=None)
     parser.add_argument('--output',  type=str,  default='data/raw',
                         help='Directorio de salida para los parquet (default: data/raw)')
     args = parser.parse_args()
 
-    data = load_data_from_neon(tables=args.tables, n_users=args.n_users)
+    data = load_data_from_aws(tables=args.tables, n_users=args.n_users)
     save_data(data, output_dir=args.output)
 
     print("\nDataFrames guardados:")

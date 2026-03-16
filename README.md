@@ -64,13 +64,13 @@ LOCAL_USER=postgres
 LOCAL_PASSWORD=tu_password
 LOCAL_PORT=5432
 
-# Neon PostgreSQL (nube)
-NEON_HOST=tu_host.neon.tech
-NEON_DATABASE=neondb
-NEON_USER=neondb_owner
-NEON_PASSWORD=tu_password
-NEON_PORT=5432
-NEON_SSLMODE=require  # Para DB local usar: disable o prefer
+# AWS RDS PostgreSQL (nube)
+AWS_HOST=
+AWS_DATABASE=
+AWS_USER=
+AWS_PASSWORD=
+AWS_PORT=
+AWS_SSLMODE=
 
 # Configuracion del proyecto
 DATA_PATH=data/raw
@@ -94,12 +94,12 @@ API_PORT=8000
 | `LOCAL_USER`             | Usuario PostgreSQL local                         | `postgres`                  |
 | `LOCAL_PASSWORD`         | Contrasena PostgreSQL local                      | -                           |
 | `LOCAL_PORT`             | Puerto PostgreSQL local                          | `5432`                      |
-| `NEON_HOST`              | Host de Neon PostgreSQL                          | -                           |
-| `NEON_DATABASE`          | Nombre de la base de datos en Neon               | `neondb`                    |
-| `NEON_USER`              | Usuario Neon                                     | -                           |
-| `NEON_PASSWORD`          | Contrasena Neon                                  | -                           |
-| `NEON_PORT`              | Puerto Neon                                      | `5432`                      |
-| `NEON_SSLMODE`           | Modo SSL Neon (`disable/prefer` si host local)   | `require`                   |
+| `AWS_HOST`               | Host de AWS RDS PostgreSQL                       | -                           |
+| `AWS_DATABASE`           | Nombre de la base de datos en AWS RDS            | -                           |
+| `AWS_USER`               | Usuario AWS RDS                                  | -                           |
+| `AWS_PASSWORD`           | Contrasena AWS RDS                               | -                           |
+| `AWS_PORT`               | Puerto AWS RDS                                   | `5432`                      |
+| `AWS_SSLMODE`            | Modo SSL AWS RDS (`disable/prefer` si host local)| `require`                   |
 | `DATA_PATH`              | Ruta a los CSVs originales                       | `data/raw`                  |
 | `RANDOM_SEED`            | Semilla aleatoria global                         | `42`                        |
 | `N_USERS`                | Usuarios a considerar en EDA local               | `100000`                    |
@@ -145,7 +145,7 @@ insight-commerce-recsys/
 |
 +-- notebooks/
 |   +-- 01_eda.ipynb                # EDA sobre CSVs completos (base local)
-|   +-- 01_eda_neon.ipynb           # EDA y validaciones V-1 a V-8 sobre NeonDB
+|   +-- 01_eda_neon.ipynb           # EDA y validaciones V-1 a V-8 sobre AWS RDS
 |   +-- 02_calidad_datos.ipynb
 |   +-- 03_feature_engineering.ipynb  # Feature matrix: calculo, validacion y guardado del parquet
 |   +-- 04_modelado.ipynb           # Modelado: LightGBM + CatBoost + Optuna (Sprint 2)
@@ -165,7 +165,7 @@ insight-commerce-recsys/
 |   +-- data/
 |   |   +-- __init__.py
 |   |   +-- data_ingestation.py
-|   |   +-- data_loader.py          # load_data_from_neon()
+|   |   +-- data_loader.py          # load_data_from_aws()
 |   |   +-- etl_dimensional.py
 |   +-- evaluation/
 |   |   +-- __init__.py
@@ -194,7 +194,7 @@ El proyecto se ejecuta en dos pasos independientes desde la raiz del repositorio
 
 ### Paso 1 — Feature pipeline
 
-Carga datos desde NeonDB, calcula features y genera el feature matrix:
+Carga datos desde AWS RDS, calcula features y genera el feature matrix:
 
 ```bash
 python -m src.features.pipeline
@@ -202,7 +202,7 @@ python -m src.features.pipeline
 
 Output: `data/processed/feature_matrix.parquet`
 
-Solo es necesario volver a correr este paso si cambian las features o los datos en NeonDB.
+Solo es necesario volver a correr este paso si cambian las features o los datos en AWS RDS.
 
 ### Paso 2 — Entrenamiento
 
@@ -288,9 +288,9 @@ El proyecto usa dos bases de datos:
 
 **Local (PostgreSQL):** modelo relacional normalizado con los CSVs originales de Instacart. Se usa como fuente para el ETL.
 
-**Neon (PostgreSQL cloud):** modelo dimensional star schema con los datos filtrados y listos para feature engineering. Free tier con 0.5 GB.
+**AWS RDS (PostgreSQL cloud):** modelo dimensional star schema con los datos filtrados y listos para feature engineering.
 
-### Esquema dimensional en Neon
+### Esquema dimensional en AWS RDS
 
 | Tabla                 | Filas     | Descripcion                                          |
 | --------------------- | --------- | ---------------------------------------------------- |
