@@ -32,7 +32,7 @@ load_dotenv(ROOT_DIR / ".env")
 # Se usan para diferenciar tipos de error y devolver el código HTTP correcto en la API
 
 class UserNotFoundError(Exception):
-    """Se lanza cuando el user_id no tiene historial en la base de datos."""
+    """Se lanza cuando el user_id no tiene ningún historial en la base de datos (0 órdenes prior)."""
     pass
 
 
@@ -44,6 +44,11 @@ class FeatureContractError(Exception):
 class DatabaseConnectionError(Exception):
     """Se lanza cuando no se puede conectar a PostgreSQL."""
     pass
+
+
+# Mínimo de órdenes prior que un usuario necesita para que el modelo ML sea aplicable.
+# Usuarios con menos órdenes reciben un ranking de popularidad personal (cold-start fallback).
+MIN_ORDERS_FOR_MODEL = 5
 
 
 @dataclass
@@ -243,6 +248,72 @@ class RecommendationService:
         """
         return self._read_sql(sql, {"product_keys": product_keys})
 
+    def _query_user_order_count(self, user_id: int) -> int:
+        """Devuelve la cantidad de órdenes prior distintas del usuario.
+
+        Retorna 0 si el usuario no existe en la tabla o no tiene historial prior.
+        Se usa antes de entrar al pipeline de features para decidir si aplicar cold-start.
+        """
+        sql = """
+            SELECT COUNT(DISTINCT order_key) AS n_orders
+            FROM fact_order_products
+            WHERE user_key = :user_id AND get_eval = 'prior'
+        """
+        result = self._read_sql(sql, {"user_id": user_id})
+        return int(result["n_orders"].iloc[0]) if not result.empty else 0
+
+    def _cold_start_top_products(self, user_id: int, top_k: int) -> List[dict]:
+        """Devuelve los top_k productos más comprados por el usuario como fallback cold-start.
+
+        Se usa cuando el usuario tiene menos de MIN_ORDERS_FOR_MODEL órdenes y no hay
+        suficiente historial para construir el feature set completo del modelo.
+        La 'probability' es la frecuencia de compra normalizada por órdenes totales
+        (cuántas de sus órdenes incluyeron ese producto), expresada entre 0 y 1.
+        """
+        sql = """
+            WITH user_stats AS (
+                SELECT COUNT(DISTINCT order_key) AS n_orders
+                FROM fact_order_products
+                WHERE user_key = :user_id AND get_eval = 'prior'
+            ),
+            product_counts AS (
+                SELECT product_key, COUNT(*) AS purchase_count
+                FROM fact_order_products
+                WHERE user_key = :user_id AND get_eval = 'prior'
+                GROUP BY product_key
+                ORDER BY purchase_count DESC
+                LIMIT :top_k
+            )
+            SELECT
+                pc.product_key,
+                pc.purchase_count,
+                ROUND(pc.purchase_count::numeric / us.n_orders, 4) AS probability
+            FROM product_counts pc
+            CROSS JOIN user_stats us
+        """
+        top = self._read_sql(sql, {"user_id": user_id, "top_k": top_k})
+
+        if top.empty:
+            return []
+
+        # Enriquece con el nombre del producto
+        product_keys = top["product_key"].astype(int).tolist()
+        product_names = (
+            self._query_user_dim_product(product_keys)
+            .loc[:, ["product_key", "product_name"]]
+            .drop_duplicates(subset=["product_key"])
+        )
+        top = top.merge(product_names, on="product_key", how="left")
+
+        return [
+            {
+                "product_key": int(row.product_key),
+                "product_name": None if pd.isna(row.product_name) else str(row.product_name),
+                "probability": float(row.probability),
+            }
+            for row in top.itertuples(index=False)
+        ]
+
     @staticmethod
     def _assign_user_cluster(
         matrix: pd.DataFrame,
@@ -410,15 +481,28 @@ class RecommendationService:
     def recommend_user(self, user_id: int, top_k: int = 10) -> List[dict]:
         """Genera las top_k recomendaciones de productos para un usuario.
 
-        Flujo completo de inferencia:
-        1. Construye la matriz de features online para el usuario
-        2. Alinea y valida las features contra el contrato del modelo
-        3. Predice la probabilidad de recompra para cada producto candidato
-        4. Ordena por probabilidad descendente y toma los top_k
-        5. Enriquece con el nombre del producto y devuelve como lista de dicts
+        Si el usuario tiene 0 órdenes prior → lanza UserNotFoundError (404).
+        Si el usuario tiene entre 1 y MIN_ORDERS_FOR_MODEL-1 órdenes (cold-start) →
+            devuelve el ranking de sus productos más comprados (sin usar el modelo ML).
+        Si el usuario tiene >= MIN_ORDERS_FOR_MODEL órdenes → flujo completo de inferencia:
+            1. Construye la matriz de features online
+            2. Alinea y valida las features contra el contrato del modelo
+            3. Predice la probabilidad de recompra con LightGBM
+            4. Ordena por probabilidad descendente y toma los top_k
+            5. Enriquece con el nombre del producto y devuelve como lista de dicts
 
         Retorna una lista de dicts con product_key, product_name y probability.
         """
+        # Verifica si el usuario tiene historia y si hay suficiente para el modelo completo
+        n_orders = self._query_user_order_count(user_id)
+        if n_orders == 0:
+            raise UserNotFoundError(
+                f"user_id {user_id} no existe en fact_order_products para get_eval='prior'."
+            )
+        if n_orders < MIN_ORDERS_FOR_MODEL:
+            # Cold-start: devuelve los productos más comprados en lugar de usar el modelo
+            return self._cold_start_top_products(user_id, top_k)
+
         # 1. Construye la matriz de features (una fila por producto candidato)
         matrix = self._build_online_matrix(user_id)
         # 2. Valida y selecciona solo las columnas que el modelo espera

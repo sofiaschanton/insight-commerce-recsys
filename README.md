@@ -268,12 +268,22 @@ curl -X POST "http://localhost:8000/recommend/batch" \
 }
 ```
 
+#### Comportamiento por cantidad de ordenes
+
+| Ordenes prior del usuario | Comportamiento |
+| ------------------------- | -------------- |
+| `0` | `404` — usuario sin historial |
+| `1 – 4` | `200` — **cold-start**: top-10 productos más comprados por el usuario (ranking por frecuencia, sin ML) |
+| `>= 5` | `200` — recomendaciones generadas por el modelo LightGBM |
+
+El campo `probability` en cold-start refleja la frecuencia de compra normalizada por órdenes (cuántas de sus órdenes incluyeron ese producto), no una probabilidad del modelo.
+
 #### Codigos de respuesta HTTP
 
 | Codigo | Causa |
 | ------ | ----- |
-| `200` | Recomendaciones generadas correctamente |
-| `404` | `user_id` no tiene historial en la base de datos |
+| `200` | Recomendaciones generadas correctamente (modelo ML o cold-start) |
+| `404` | `user_id` no tiene ningún historial en la base de datos (0 órdenes prior) |
 | `400` | Las features calculadas no coinciden con el contrato del modelo |
 | `503` | No se pudo conectar a PostgreSQL (verificar `.env` y estado de Neon) |
 | `500` | Error interno inesperado (ver `src/api/reports/logs/api.log`) |
