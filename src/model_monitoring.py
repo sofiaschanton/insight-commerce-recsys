@@ -126,8 +126,12 @@ def _load_data(
             s3.download_fileobj(S3_BUCKET, current_key, buf)
             buf.seek(0)
             df_curr = pd.read_parquet(buf)
-        except Exception:
-            logging.error(f"No se encontró feature_matrix en S3 (key='{current_key}').")
+        except Exception as e:
+            logging.error(
+                f"Error crítico al descargar feature_matrix desde S3 "
+                f"(bucket='{S3_BUCKET}', key='{current_key}'): {e}. "
+                "Verificar credenciales AWS y que el archivo exista en el bucket."
+            )
             sys.exit(1)
 
         try:
@@ -135,9 +139,9 @@ def _load_data(
             s3.download_fileobj(S3_BUCKET, ref_key, buf)
             buf.seek(0)
             df_ref = pd.read_parquet(buf)
-        except Exception:
+        except Exception as e:
             logging.warning(
-                f"No se encontró parquet de referencia en S3 (key='{ref_key}'). "
+                f"No se encontró parquet de referencia en S3 (bucket='{S3_BUCKET}', key='{ref_key}'): {e}. "
                 "Saltando monitoreo de drift — se necesitan al menos dos corridas del pipeline "
                 "para comparar distribuciones. Ejecutar de nuevo tras el primer reentrenamiento."
             )
@@ -150,7 +154,10 @@ def _load_data(
         return df_ref, df_curr
 
     if not os.path.exists(current_path):
-        logging.error(f"No se encontró feature_matrix en '{current_path}'.")
+        logging.error(
+            f"No se encontró feature_matrix en '{current_path}'. "
+            "Asegurarse de que el pipeline de features haya corrido y generado el archivo antes de ejecutar el monitoreo."
+        )
         sys.exit(1)
 
     if not os.path.exists(reference_path):
@@ -202,7 +209,9 @@ def compute_drift_metrics(
     ]
     if not available:
         logging.error(
-            "Ninguna de las features monitoreadas existe en los datos. Abortando."
+            f"Ninguna de las features monitoreadas ({MONITORED_FEATURES}) existe en los datos. "
+            f"Columnas disponibles en referencia: {list(df_ref.columns)}. "
+            "Revisar que el pipeline de features genere las columnas esperadas."
         )
         sys.exit(1)
 
@@ -214,7 +223,10 @@ def compute_drift_metrics(
         cur_vals = df_curr[feat].dropna().values.astype(float)
 
         if len(ref_vals) == 0 or len(cur_vals) == 0:
-            logging.warning(f"  '{feat}': sin valores válidos, se omite.")
+            logging.warning(
+                f"  '{feat}': sin valores válidos tras eliminar NaN "
+                f"(ref={len(ref_vals)}, actual={len(cur_vals)}). Se omite esta feature."
+            )
             continue
 
         psi_by_feature[feat] = round(_compute_psi(ref_vals, cur_vals), 4)
@@ -225,7 +237,10 @@ def compute_drift_metrics(
         )
 
     if not psi_by_feature:
-        logging.error("No se pudieron calcular métricas para ninguna feature.")
+        logging.error(
+            "No se pudieron calcular métricas para ninguna feature — todas fueron omitidas por falta de valores válidos. "
+            "Revisar calidad de datos en el parquet de entrada."
+        )
         sys.exit(1)
 
     psi = round(float(np.mean(list(psi_by_feature.values()))), 3)
@@ -242,12 +257,13 @@ def compute_drift_metrics(
 
     if drift_detected:
         logging.warning(
-            f"ALERTA DE DRIFT: métricas superan el umbral. PSI={psi}, KS={ks}"
+            f"ALERTA DE DRIFT: las métricas superan los umbrales de estabilidad "
+            f"(PSI={psi} umbral=0.25, KS={ks} umbral=0.30). "
+            "Acción recomendada: evaluar reentrenamiento del modelo con datos recientes."
         )
-        logging.warning("Acción recomendada: evaluar reentrenamiento del modelo.")
     else:
         logging.info(
-            f"Métricas estables. PSI={psi}, KS={ks}. No se requiere reentrenar."
+            f"Distribución estable. PSI={psi} (<0.25), KS={ks} (<0.30). No se requiere reentrenar."
         )
 
     output_path = os.path.join(output_dir, "drift_report.json")
