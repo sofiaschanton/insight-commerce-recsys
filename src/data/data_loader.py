@@ -46,14 +46,14 @@ def _build_db_url() -> str:
     Usamos URL.create() en lugar de f-string para manejar correctamente
     caracteres especiales en la contraseña (ej: @, #, %).
     """
-    return URL.create(
+    return str(URL.create(
         drivername = 'postgresql+psycopg2',
         username   = os.getenv('AWS_USER'),
         password   = os.getenv('AWS_PASSWORD'),
         host       = os.getenv('AWS_HOST'),
-        port       = os.getenv('AWS_PORT'),
+        port       = int(os.getenv('AWS_PORT', '5432')),
         database   = os.getenv('AWS_DATABASE'),
-    )
+    ))
 
 # ─── Configuración de tablas ──────────────────────────────────────────────────
 # Tablas disponibles en el schema dimensional de AWS RDS
@@ -161,6 +161,21 @@ def load_data_from_aws(
     ...     }
     ... )
     """
+
+    # ── Validación ─────────────────────────────────────────────────────────
+    # Si no se usan esquemas custom, validamos que las tablas pedidas existan en _TABLE_CONFIG
+    if not esquemas:
+        invalid = [t for t in tables if t not in _TABLE_CONFIG]
+        if invalid:
+            raise ValueError(f"Tablas no reconocidas: {invalid}. Válidas: {AVAILABLE_TABLES}")
+
+    # Si se usan esquemas custom, deben tener el mismo largo que tables
+    if esquemas and len(esquemas) != len(tables):
+        raise ValueError(
+            f"'esquemas' debe tener el mismo largo que 'tables' ({len(esquemas)} != {len(tables)})."
+        )
+    
+
     # ── Conexión ───────────────────────────────────────────────────────────
     # Si se pasan credenciales externas se construye la URL manualmente,
     # sino se usa _build_db_url() que lee del .env
@@ -216,19 +231,6 @@ def load_data_from_aws(
         f"load_data_from_aws — tables={tables} | "
         f"n_users={n_users} | date_range={date_range}"
     )
-
-    # ── Validación ─────────────────────────────────────────────────────────
-    # Si no se usan esquemas custom, validamos que las tablas pedidas existan en _TABLE_CONFIG
-    if not esquemas:
-        invalid = [t for t in tables if t not in _TABLE_CONFIG]
-        if invalid:
-            raise ValueError(f"Tablas no reconocidas: {invalid}. Válidas: {AVAILABLE_TABLES}")
-
-    # Si se usan esquemas custom, deben tener el mismo largo que tables
-    if esquemas and len(esquemas) != len(tables):
-        raise ValueError(
-            f"'esquemas' debe tener el mismo largo que 'tables' ({len(esquemas)} != {len(tables)})."
-        )
 
     # ── Sampleo de usuarios ────────────────────────────────────────────────
     # Si n_users está definido, sampleamos N usuarios aleatorios de la fact table

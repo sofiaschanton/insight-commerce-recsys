@@ -15,6 +15,7 @@ from src.api.schemas import (
     BatchRequest,
     BatchResponse,
     HealthResponse,
+    RecommendationItem,
     RecommendResponse,
 )
 
@@ -108,7 +109,8 @@ def recommend_batch(payload: BatchRequest) -> BatchResponse:
     results = []
     for user_id in payload.user_ids:
         try:
-            recommendations = service.recommend_user(user_id=user_id, top_k=10)
+            recs = service.recommend_user(user_id=user_id, top_k=10)
+            recommendations = [RecommendationItem(**r) for r in recs]
             results.append(BatchItemResult(user_id=user_id, recommendations=recommendations))
         except UserNotFoundError as err:
             # Usuario no encontrado → se registra en el resultado pero no falla el batch
@@ -130,7 +132,8 @@ def recommend_user(user_id: int) -> RecommendResponse:
     """
     logger.info("POST /recommend/{user_id} | user_id=%s", user_id)
     try:
-        recommendations = service.recommend_user(user_id=user_id, top_k=10)
+        recs = service.recommend_user(user_id=user_id, top_k=10)
+        recommendations = [RecommendationItem(**r) for r in recs]
     except UserNotFoundError as err:
         raise HTTPException(status_code=404, detail=str(err)) from err
     except FeatureContractError as err:

@@ -1,6 +1,7 @@
-from typing import List, Optional
+from typing import Annotated, List, Optional
 
-from pydantic import BaseModel, Field, conlist
+from pydantic import BaseModel, Field
+from pydantic import conlist
 
 # Este archivo define los esquemas de entrada y salida de la API usando Pydantic.
 # Pydantic valida automáticamente los tipos de datos: si el cliente manda un valor
@@ -32,7 +33,7 @@ class BatchRequest(BaseModel):
     El cliente envía una lista de user_ids y recibe recomendaciones para todos a la vez.
     Se acepta un mínimo de 1 y un máximo de 100 usuarios por llamada.
     """
-    user_ids: conlist(int, min_length=1, max_length=100) = Field(
+    user_ids: Annotated[List[int], Field(min_length=1, max_length=100)] = Field(
         ..., description="Lista de user_id (1 a 100)"
     )
 
