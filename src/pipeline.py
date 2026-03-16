@@ -16,15 +16,20 @@ Uso:
 """
 
 import argparse
+import io
 import logging
 import os
 
+import boto3
 import mlflow
 
 from src.data.data_loader import load_data_from_aws
 from src.data.validate_data import validate as validate_feature_matrix
 from src.features.feature_engineering import build_feature_matrix
 from src.models.train import MODELS_DIR, N_OPTUNA_TRIALS, train
+
+S3_BUCKET = os.getenv("S3_BUCKET", "insight-commerce-artifacts")
+USE_S3 = os.getenv("USE_S3", "false").lower() == "true"
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 os.makedirs("reports/logs", exist_ok=True)
@@ -159,6 +164,18 @@ def run_pipeline(
         mlflow.log_artifact(str(MODELS_DIR / "model.pkl"))
         mlflow.log_artifact(str(MODELS_DIR / "cluster_models.pkl"))
         mlflow.log_artifact(str(MODELS_DIR / "model_log.json"))
+
+        # ── Upload feature matrix a S3 como referencia para drift monitoring ──
+        if USE_S3:
+            _buf = io.BytesIO()
+            matrix.to_parquet(_buf, index=False)
+            _buf.seek(0)
+            boto3.client("s3").put_object(
+                Bucket=S3_BUCKET,
+                Key="feature_matrix_reference.parquet",
+                Body=_buf.read(),
+            )
+            logger.info(f"feature_matrix_reference.parquet subido a s3://{S3_BUCKET}/")
 
         logger.info("=" * 60)
         logger.info("Pipeline completado exitosamente")

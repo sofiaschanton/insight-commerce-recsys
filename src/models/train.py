@@ -41,6 +41,7 @@ Conexion con el resto del pipeline:
 """
 
 import argparse
+import io
 import json
 import logging
 import os
@@ -48,6 +49,8 @@ import time
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple
+
+import boto3
 import mlflow
 import mlflow.lightgbm
 import joblib
@@ -86,6 +89,9 @@ if not logger.handlers:
 # ── Constantes ────────────────────────────────────────────────────────────────
 FEATURE_MATRIX_PATH = Path("data/processed/feature_matrix.parquet")
 MODELS_DIR          = Path("models")
+
+S3_BUCKET = os.getenv("S3_BUCKET", "insight-commerce-artifacts")
+USE_S3 = os.getenv("USE_S3", "false").lower() == "true"
 
 ID_COLS    = ["user_key", "product_key"]
 LABEL_COL  = "label"
@@ -491,10 +497,25 @@ def train(
         cluster_path      = models_dir / "cluster_models.pkl"
         log_path          = models_dir / "model_log.json"
 
+        old_log = None
         if log_path.exists():
             try:
                 with open(log_path, encoding="utf-8") as _f:
                     old_log = json.load(_f)
+            except (json.JSONDecodeError, KeyError) as _e:
+                logger.warning(f"No se pudo leer model_log.json local para rollback check: {_e}. Continuando.")
+        elif USE_S3:
+            try:
+                _s3 = boto3.client("s3")
+                _buf = io.BytesIO()
+                _s3.download_fileobj(S3_BUCKET, "model_log.json", _buf)
+                _buf.seek(0)
+                old_log = json.loads(_buf.read().decode("utf-8"))
+            except Exception as _e:
+                logger.warning(f"No se pudo leer model_log.json desde S3 para rollback check: {_e}. Continuando.")
+
+        if old_log is not None:
+            try:
                 old_f1 = float(old_log.get("metrics_test", {}).get("f1", 0.0))
                 new_f1 = metrics["f1"]
                 if old_f1 > 0 and new_f1 < old_f1 * 0.95:
@@ -510,7 +531,7 @@ def train(
                         "Los artefactos del modelo anterior NO fueron sobreescritos."
                     )
             except (json.JSONDecodeError, KeyError) as _e:
-                logger.warning(f"No se pudo leer model_log.json para rollback check: {_e}. Continuando.")
+                logger.warning(f"No se pudo evaluar rollback desde model_log.json: {_e}. Continuando.")
 
         # ── 10. Serializar ────────────────────────────────────────────────────────
         joblib.dump(model,          model_path)
@@ -546,6 +567,13 @@ def train(
         }
         with open(log_path, "w", encoding="utf-8") as f:
             json.dump(log, f, indent=2, ensure_ascii=False)
+
+        if USE_S3:
+            _s3 = boto3.client("s3")
+            _s3.upload_file(str(model_path),   S3_BUCKET, "model.pkl")
+            _s3.upload_file(str(cluster_path), S3_BUCKET, "cluster_models.pkl")
+            _s3.upload_file(str(log_path),     S3_BUCKET, "model_log.json")
+            logger.info(f"Artefactos subidos a s3://{S3_BUCKET}/: model.pkl, cluster_models.pkl, model_log.json")
 
         mlflow.lightgbm.log_model(model, artifact_path="lightgbm_model") # Nombre del modelo lightGBM que se uso y en path donde se guarda en MLFlow
         mlflow.log_artifact(local_path=str(cluster_path), artifact_path="cluster_models") 

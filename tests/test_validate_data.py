@@ -7,10 +7,13 @@ Usan DataFrames sintéticos en memoria; no leen parquet ni archivos reales.
 El reporte JSON se escribe en tmp_path para no contaminar el proyecto.
 """
 
+import json
+from unittest.mock import patch
+
 import pandas as pd
 import pytest
 
-from src.data.validate_data import validate
+from src.data.validate_data import main, validate
 from src.features.feature_engineering import FEATURE_MATRIX_COLUMNS, NULLABLE_COLUMNS
 
 _NON_NULLABLE = [c for c in FEATURE_MATRIX_COLUMNS if c not in NULLABLE_COLUMNS]
@@ -232,3 +235,58 @@ def test_multiple_failures_all_reported(tmp_path):
     assert report["label_binary"]["passed"] is False
     assert report["up_times_purchased_positive"]["passed"] is False
     assert report["user_total_orders_positive"]["passed"] is False
+
+
+# ── Tests: main() — entry point CLI ──────────────────────────────────────────
+
+def test_main_skips_when_parquet_not_found(tmp_path):
+    """Cuando el path no existe, main() escribe skipped=true y hace sys.exit(0)."""
+    missing_path = str(tmp_path / "nonexistent.parquet")
+    output_dir = str(tmp_path / "reports")
+
+    with patch("sys.argv", ["validate_data", "--path", missing_path, "--output-dir", output_dir]):
+        with pytest.raises(SystemExit) as exc_info:
+            main()
+
+    assert exc_info.value.code == 0
+
+    report_file = tmp_path / "reports" / "validation_report.json"
+    assert report_file.exists()
+    report = json.loads(report_file.read_text())
+    assert report["skipped"] is True
+    assert report["all_passed"] is True
+
+
+def test_main_exits_1_when_validation_fails(tmp_path):
+    """Cuando el parquet existe pero falla algún check, main() hace sys.exit(1)."""
+    df = _make_valid_df()
+    df.loc[0, "label"] = 99  # fuerza fallo en label_binary
+    parquet_path = tmp_path / "feature_matrix.parquet"
+    df.to_parquet(parquet_path)
+    output_dir = str(tmp_path / "reports")
+
+    with patch("sys.argv", ["validate_data", "--path", str(parquet_path), "--output-dir", output_dir]):
+        with pytest.raises(SystemExit) as exc_info:
+            main()
+
+    assert exc_info.value.code == 1
+
+
+def test_main_exits_0_when_validation_passes(tmp_path):
+    """Cuando el parquet existe y pasa todos los checks, main() retorna sin sys.exit(1).
+
+    main() no llama sys.exit(0) explícitamente en el caso exitoso — simplemente
+    retorna, lo que corresponde a código de salida 0.
+    """
+    df = _make_valid_df()
+    parquet_path = tmp_path / "feature_matrix.parquet"
+    df.to_parquet(parquet_path)
+    output_dir = str(tmp_path / "reports")
+
+    with patch("sys.argv", ["validate_data", "--path", str(parquet_path), "--output-dir", output_dir]):
+        main()  # no debe lanzar SystemExit
+
+    report_file = tmp_path / "reports" / "validation_report.json"
+    assert report_file.exists()
+    report = json.loads(report_file.read_text())
+    assert report["all_passed"] is True

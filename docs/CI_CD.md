@@ -20,7 +20,13 @@ push a main / workflow_dispatch
                 ├─ 1. model_monitoring.py → drift_report.json
                 ├─ 2. lee drift_detected
                 ├─ 3. si false → job termina sin entrenar
-                └─ 4. si true  → pipeline.py --trials 50 → rollback check → sube artefactos
+                ├─ 4. si true  → pipeline.py --trials 50 → rollback check → sube artefactos
+                └─── deploy (needs: retrain, solo si retrain exitoso)
+                        │
+                        ├─ 1. build imagen Docker → push a ECR
+                        ├─ 2. actualizar task definition de ECS
+                        ├─ 3. ECS rolling deploy (wait-for-service-stability)
+                        └─ 4. health check GET /health → rollback automático si falla
 
 schedule (lunes 8am UTC)
         │
@@ -42,8 +48,8 @@ El job `test` corre en push y pull_request (no en schedule). El job `data-valida
 |---|---|---|
 | `push` | `test` | `main`, `develop`, `feature/**`, `fix/**` |
 | `pull_request` | `test` | `main`, `develop` |
-| `push` a `main` | `data-validation` → `retrain` | rama `main` |
-| `workflow_dispatch` | `data-validation` → `retrain` | manual desde GitHub UI |
+| `push` a `main` | `data-validation` → `retrain` → `deploy` | rama `main` |
+| `workflow_dispatch` | `data-validation` → `retrain` → `deploy` | manual desde GitHub UI |
 | `schedule` (cron) | `drift_check` | lunes 8am UTC |
 
 ---
@@ -134,6 +140,84 @@ Corre automáticamente cada lunes para detectar si la distribución de los datos
 
 ---
 
+### 5. `deploy` — Deploy a ECS Fargate
+
+**Runner:** `ubuntu-latest`
+**Trigger:** post-retrain exitoso — solo corre si el job `retrain` terminó con `result == 'success'`
+**Depende de:** `retrain`
+
+El deploy **no se dispara en cada merge a `main`**. Solo ocurre cuando hay un modelo nuevo entrenado, es decir, cuando `retrain` completó exitosamente (drift detectado o `workflow_dispatch`). Esto evita redeploys innecesarios cuando no hay cambio de modelo.
+
+| Paso | Descripción |
+|---|---|
+| Configure AWS credentials | Autentica con IAM usando `aws-actions/configure-aws-credentials@v4` y los secrets `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION` |
+| Login to Amazon ECR | Login al registry privado con `aws-actions/amazon-ecr-login@v2` |
+| Build & push Docker image | Construye la imagen de la API desde el `Dockerfile` del repo y la sube a ECR con tag `${{ github.sha }}` |
+| Update ECS task definition | Descarga la task definition actual, inyecta la nueva imagen y genera la versión actualizada con `aws-actions/amazon-ecs-render-task-definition@v1` |
+| Deploy to ECS (rolling) | Registra la nueva task definition y actualiza el servicio ECS con `aws-actions/amazon-ecs-deploy-task-definition@v1`. Espera hasta que el servicio esté estable (`wait-for-service-stability: true`). Si las tasks nuevas no pasan el health check del ALB, ECS revierte automáticamente. |
+| Health check | Llama a `GET /health` sobre el endpoint del ALB. Si responde HTTP distinto de 200, el step falla y queda registro del error en el log. |
+
+El modelo vive en S3 (`insight-commerce-artifacts`) y la API lo descarga en el startup del contenedor — no se embebe en la imagen Docker.
+
+**Placeholders a completar cuando Fargate esté configurado:**
+
+| Variable | Dónde se usa | Descripción |
+|---|---|---|
+| `ECS_CLUSTER` | step deploy | Nombre del cluster ECS Fargate |
+| `ECS_SERVICE` | step deploy y describe task-definition | Nombre del servicio ECS |
+| `ECR_REPOSITORY` | step build & push | Nombre del repositorio en ECR |
+| `CONTAINER_NAME` | step render task-definition | Nombre del contenedor dentro de la task definition |
+
+---
+
+## CD — Continuous Delivery
+
+### Estrategia elegida: Rolling Update con ECS Fargate + ALB
+
+La API corre en ECS Fargate dentro de una VPC privada, expuesta al exterior a través de un Application Load Balancer (ALB). La estrategia de deploy es **rolling update nativo de ECS**: ECS reemplaza gradualmente las tasks con la versión nueva, drena el tráfico de las tasks viejas a través del ALB y revierte automáticamente si las tasks nuevas no superan el health check configurado en el target group.
+
+**Flujo del job `deploy`:**
+
+```
+retrain exitoso
+       │
+       └─ build imagen Docker (tag: ${{ github.sha }})
+               │
+               └─ push a ECR (insight-commerce-artifacts region)
+                       │
+                       └─ render nueva task definition (imagen actualizada)
+                               │
+                               └─ ECS rolling deploy (wait-for-service-stability)
+                                       │
+                               ┌───────┴───────┐
+                          tasks OK          tasks fallan
+                               │                │
+                        health check        rollback automático
+                        GET /health         (ECS revierte a versión anterior)
+                               │
+                        HTTP 200 → OK
+```
+
+**¿Por qué el deploy no corre en cada merge a `main`?**
+El modelo de recomendación no cambia con cambios de código que no impliquen reentrenamiento. Un merge de código sin drift no produce un artefacto nuevo en S3 — forzar un redeploy en ese caso sería un deploy vacío. El trigger correcto es un modelo nuevo, no un commit nuevo.
+
+---
+
+### Rolling Update vs Blue/Green
+
+| Criterio | Rolling Update (implementado) | Blue/Green (mejora futura) |
+|---|---|---|
+| **Costo** | Sin costo adicional — mismo número de tasks Fargate durante el deploy | Alto — duplica el costo de ECS Fargate durante ~24hs (dos entornos completos activos en paralelo) |
+| **Complejidad** | Baja — nativo en ECS, sin infraestructura extra | Alta — requiere AWS CodeDeploy + reglas en el ALB + grupos de targets adicionales |
+| **Overlap de instancias** | Momentáneo — ECS levanta tasks nuevas antes de bajar las viejas | Total — environment blue y green completos activos en simultáneo hasta confirmar el cutover |
+| **Tiempo de rollback** | Automático y rápido — ECS revierte si el health check falla durante el deploy | Inmediato — switch de tráfico en el ALB (0 downtime), pero requiere aprobación manual o gate automático |
+| **Visibilidad del estado** | Limitada — solo logs de ECS y métricas del ALB | Alta — CodeDeploy registra cada fase del deployment con aprobaciones y hooks |
+| **Adecuado para** | Proyectos con SLA flexible, equipo pequeño, bajo presupuesto | Producción con SLA estricto (< 1s de downtime), tráfico crítico, requisitos de auditoría |
+
+**Blue/Green como mejora futura recomendada:** para un entorno de producción con SLA estricto (e-commerce con tráfico real), blue/green es la estrategia ideal. Requiere integrar AWS CodeDeploy al pipeline, configurar dos target groups en el ALB y definir un gate de validación (health check + smoke tests) antes de redirigir el 100% del tráfico. El costo de duplicar Fargate durante las primeras 24hs post-deploy es el trade-off aceptable para garantizar rollback instantáneo sin impacto en usuarios.
+
+---
+
 ### SonarCloud — Análisis estático
 
 Corre dentro del job `test` como último paso (no es un job separado).
@@ -207,11 +291,13 @@ python -m src.data.validate_data
 | Reporte SonarCloud | job `test` (paso SonarCloud) | Dashboard en sonarcloud.io | N/A |
 | `reports/data/validation_report.json` | job `data-validation` | Revisión manual / auditoría | 7 días |
 | `drift_report.json` | job `drift_check` / job `retrain` | Trazabilidad de drift | 30 días |
-| `models/model.pkl`, `cluster_models.pkl`, `model_log.json` | job `retrain` | Descarga manual / deploy | 30 días |
+| `models/model.pkl`, `cluster_models.pkl`, `model_log.json` | job `retrain` | Job `deploy` (vía S3 en startup del contenedor) | 30 días |
+| Imagen Docker de la API | job `deploy` | ECS Fargate | ECR (sin expiración — gestionar lifecycle policy) |
 
 ---
 
 ## Extensiones futuras
 
-- **CD:** agregar job `deploy` que construya la imagen Docker de la API y la suba a un registry (ECR, GHCR) cuando se mergea a `main`
-- **Integration tests de API:** job separado que levante la API con `uvicorn` y valide los endpoints `/recommend` con datos reales
+- **Blue/Green deploy:** reemplazar el rolling update por blue/green con AWS CodeDeploy para entornos de producción con SLA estricto (ver tabla comparativa en la sección CD)
+- **Integration tests de API:** job separado que valide los endpoints `/recommend` contra el entorno de staging antes del cutover a producción
+- **ECR lifecycle policy:** configurar política de retención en ECR para limpiar imágenes viejas automáticamente y controlar costos de almacenamiento

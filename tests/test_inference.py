@@ -747,6 +747,7 @@ class TestRecommendUser:
         monkeypatch.setattr(service, "_build_online_matrix", lambda uid: matrix)
         monkeypatch.setattr(service, "_align_and_validate", lambda m: m[cols])
         monkeypatch.setattr(service, "_query_user_dim_product", lambda pks: self._make_product_names_df())
+        service._query_user_order_count = MagicMock(return_value=10)
 
         result = service.recommend_user(user_id=1, top_k=10)
 
@@ -761,6 +762,7 @@ class TestRecommendUser:
         monkeypatch.setattr(service, "_build_online_matrix", lambda uid: matrix)
         monkeypatch.setattr(service, "_align_and_validate", lambda m: m[cols])
         monkeypatch.setattr(service, "_query_user_dim_product", lambda pks: self._make_product_names_df())
+        service._query_user_order_count = MagicMock(return_value=10)
 
         result = service.recommend_user(user_id=1, top_k=10)
 
@@ -777,6 +779,7 @@ class TestRecommendUser:
         monkeypatch.setattr(service, "_build_online_matrix", lambda uid: matrix)
         monkeypatch.setattr(service, "_align_and_validate", lambda m: m[cols])
         monkeypatch.setattr(service, "_query_user_dim_product", lambda pks: self._make_product_names_df())
+        service._query_user_order_count = MagicMock(return_value=10)
 
         result = service.recommend_user(user_id=1, top_k=3)
 
@@ -790,6 +793,7 @@ class TestRecommendUser:
         monkeypatch.setattr(service, "_build_online_matrix", lambda uid: matrix)
         monkeypatch.setattr(service, "_align_and_validate", lambda m: m[cols])
         monkeypatch.setattr(service, "_query_user_dim_product", lambda pks: self._make_product_names_df())
+        service._query_user_order_count = MagicMock(return_value=10)
 
         result = service.recommend_user(user_id=1, top_k=10)
 
@@ -804,6 +808,7 @@ class TestRecommendUser:
         monkeypatch.setattr(service, "_build_online_matrix", lambda uid: matrix)
         monkeypatch.setattr(service, "_align_and_validate", lambda m: m[cols])
         monkeypatch.setattr(service, "_query_user_dim_product", lambda pks: self._make_product_names_df())
+        service._query_user_order_count = MagicMock(return_value=10)
 
         result = service.recommend_user(user_id=1, top_k=5)
 
@@ -817,6 +822,7 @@ class TestRecommendUser:
         monkeypatch.setattr(service, "_build_online_matrix", lambda uid: matrix)
         monkeypatch.setattr(service, "_align_and_validate", lambda m: m[cols])
         monkeypatch.setattr(service, "_query_user_dim_product", lambda pks: self._make_product_names_df())
+        service._query_user_order_count = MagicMock(return_value=10)
 
         result = service.recommend_user(user_id=1, top_k=5)
 
@@ -833,6 +839,7 @@ class TestRecommendUser:
         monkeypatch.setattr(service, "_build_online_matrix", lambda uid: matrix)
         monkeypatch.setattr(service, "_align_and_validate", lambda m: m[cols])
         monkeypatch.setattr(service, "_query_user_dim_product", lambda pks: empty_names)
+        service._query_user_order_count = MagicMock(return_value=10)
 
         result = service.recommend_user(user_id=1, top_k=5)
 
@@ -847,6 +854,173 @@ class TestRecommendUser:
             "_build_online_matrix",
             MagicMock(side_effect=UserNotFoundError("user 99 not found")),
         )
+        service._query_user_order_count = MagicMock(return_value=10)
 
         with pytest.raises(UserNotFoundError):
             service.recommend_user(user_id=99, top_k=10)
+
+
+# ─── Cold-start ───────────────────────────────────────────────────────────────
+
+class TestColdStart:
+
+    def test_cold_start_triggered_when_few_orders(self):
+        """Cuando hay menos de MIN_ORDERS_FOR_MODEL órdenes, se usa cold-start y no el pipeline."""
+        service = _make_full_service()
+        service._query_user_order_count = MagicMock(return_value=3)  # 3 < 5
+        service._cold_start_top_products = MagicMock(return_value=[
+            {"product_key": 1, "product_name": "Apple", "probability": 0.5}
+        ])
+        service._build_online_matrix = MagicMock()
+
+        result = service.recommend_user(user_id=1, top_k=5)
+
+        service._cold_start_top_products.assert_called_once_with(1, 5)
+        service._build_online_matrix.assert_not_called()
+        assert result == [{"product_key": 1, "product_name": "Apple", "probability": 0.5}]
+
+    def test_cold_start_not_triggered_when_enough_orders(self):
+        """Cuando hay suficientes órdenes, se usa el pipeline completo y no cold-start."""
+        cols = ["feat_a"]
+        service = _make_full_service()
+        service.feature_cols = cols
+        service.n_features = len(cols)
+
+        mock_model = MagicMock()
+        mock_model.predict_proba.return_value = np.array([[0.3, 0.7]])
+        service._artifacts = MagicMock()
+        service._artifacts.model = mock_model
+        service._engine = MagicMock()
+
+        service._query_user_order_count = MagicMock(return_value=10)  # 10 >= 5
+        service._cold_start_top_products = MagicMock()
+
+        matrix = pd.DataFrame({"product_key": [1], "feat_a": [0.5]})
+        service._build_online_matrix = MagicMock(return_value=matrix)
+        service._align_and_validate = MagicMock(return_value=matrix[cols])
+        service._query_user_dim_product = MagicMock(
+            return_value=pd.DataFrame({"product_key": [1], "product_name": ["Apple"]})
+        )
+
+        service.recommend_user(user_id=1, top_k=10)
+
+        service._build_online_matrix.assert_called_once_with(1)
+        service._cold_start_top_products.assert_not_called()
+
+    def test_query_user_order_count_calls_read_sql(self):
+        """_query_user_order_count delega en _read_sql pasando el user_id correcto."""
+        service = _make_full_service()
+        mock_df = pd.DataFrame({"n_orders": [7]})
+        service._read_sql = MagicMock(return_value=mock_df)
+
+        result = service._query_user_order_count(user_id=42)
+
+        assert result == 7
+        service._read_sql.assert_called_once()
+        params = service._read_sql.call_args[0][1]
+        assert params["user_id"] == 42
+
+    def test_cold_start_returns_empty_when_no_products(self):
+        """Cuando cold-start no encuentra productos, recommend_user devuelve lista vacía."""
+        service = _make_full_service()
+        service._query_user_order_count = MagicMock(return_value=3)  # 3 < 5
+        service._cold_start_top_products = MagicMock(return_value=[])
+
+        result = service.recommend_user(user_id=1, top_k=5)
+
+        assert result == []
+
+
+# ─── TestLoadModelFromS3 ──────────────────────────────────────────────────────
+
+class TestLoadModelFromS3:
+
+    def test_loads_model_from_s3(self):
+        """Cuando USE_S3=true, _load_artifacts descarga model.pkl desde S3 con boto3."""
+        call_count = 0
+
+        def download_side_effect(bucket, key, fileobj):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 3:  # tercera llamada es model_log.json — necesita JSON válido
+                fileobj.write(
+                    b'{"model_name": "lgbm", "n_features": 2, "feature_cols": ["a", "b"]}'
+                )
+
+        mock_s3 = MagicMock()
+        mock_s3.download_fileobj.side_effect = download_side_effect
+
+        with patch("src.api.inference.USE_S3", True), \
+             patch("src.api.inference.boto3.client", return_value=mock_s3), \
+             patch("src.api.inference.joblib.load", return_value=MagicMock()):
+            service = _make_full_service()
+            artifacts = service._load_artifacts()
+
+        assert mock_s3.download_fileobj.call_count == 3
+        first_call_args = mock_s3.download_fileobj.call_args_list[0][0]
+        assert first_call_args[1] == "model.pkl"
+        assert artifacts is not None
+
+    def test_raises_if_s3_download_fails(self):
+        """Si download_fileobj lanza una excepción, _load_artifacts la propaga sin atraparla."""
+        mock_s3 = MagicMock()
+        mock_s3.download_fileobj.side_effect = OSError("S3 connection failed")
+
+        with patch("src.api.inference.USE_S3", True), \
+             patch("src.api.inference.boto3.client", return_value=mock_s3):
+            service = _make_full_service()
+            with pytest.raises(OSError):
+                service._load_artifacts()
+
+
+# ─── TestColdStartTopProducts ─────────────────────────────────────────────────
+
+class TestColdStartTopProducts:
+
+    def _make_top_df(self) -> pd.DataFrame:
+        return pd.DataFrame({
+            "product_key": [10, 20, 30],
+            "purchase_count": [5, 3, 2],
+            "probability": [0.5, 0.3, 0.2],
+        })
+
+    def _make_names_df(self) -> pd.DataFrame:
+        return pd.DataFrame({
+            "product_key": [10, 20, 30],
+            "product_name": ["Apple", "Banana", "Cherry"],
+        })
+
+    def test_returns_top_k_products(self):
+        """_cold_start_top_products devuelve lista de dicts con las claves requeridas."""
+        service = _make_full_service()
+        service._read_sql = MagicMock(return_value=self._make_top_df())
+        service._query_user_dim_product = MagicMock(return_value=self._make_names_df())
+
+        result = service._cold_start_top_products(user_id=1, top_k=3)
+
+        assert isinstance(result, list)
+        assert len(result) == 3
+        assert all({"product_key", "product_name", "probability"} <= r.keys() for r in result)
+        assert all(isinstance(r["product_key"], int) for r in result)
+        assert all(isinstance(r["probability"], float) for r in result)
+
+    def test_returns_empty_when_no_products(self):
+        """Cuando _read_sql devuelve DataFrame vacío, _cold_start_top_products devuelve []."""
+        service = _make_full_service()
+        service._read_sql = MagicMock(return_value=pd.DataFrame())
+
+        result = service._cold_start_top_products(user_id=1, top_k=5)
+
+        assert result == []
+
+    def test_enriches_with_product_name(self):
+        """_cold_start_top_products llama a _query_user_dim_product con los product_keys del top."""
+        service = _make_full_service()
+        service._read_sql = MagicMock(return_value=self._make_top_df())
+        service._query_user_dim_product = MagicMock(return_value=self._make_names_df())
+
+        result = service._cold_start_top_products(user_id=7, top_k=3)
+
+        service._query_user_dim_product.assert_called_once_with([10, 20, 30])
+        assert result[0]["product_name"] == "Apple"
+        assert result[1]["product_name"] == "Banana"

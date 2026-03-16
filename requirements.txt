@@ -16,6 +16,7 @@ pyyaml
 joblib
 optuna
 psycopg2-binary
+boto3>=1.26
 sqlalchemy>=2.0
 pyarrow>=12.0
 supabase

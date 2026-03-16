@@ -1,9 +1,11 @@
+import io
 import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List
 
+import boto3
 import joblib
 import numpy as np
 import pandas as pd
@@ -26,6 +28,9 @@ from src.models.train import PRODUCT_CLUSTER_FEATURES, USER_CLUSTER_FEATURES
 ROOT_DIR = Path(__file__).resolve().parents[2]
 # Carga las variables de entorno desde el archivo .env (credenciales de DB, rutas de modelos, etc.)
 load_dotenv(ROOT_DIR / ".env")
+
+S3_BUCKET = os.getenv("S3_BUCKET", "insight-commerce-artifacts")
+USE_S3 = os.getenv("USE_S3", "false").lower() == "true"
 
 
 # --- Excepciones personalizadas ---
@@ -91,11 +96,33 @@ class RecommendationService:
         self.feature_cols = list(self._artifacts.model_log.get("feature_cols", []))
 
     def _load_artifacts(self) -> LoadedArtifacts:
-        """Carga desde disco el modelo, los modelos de clustering y el log del modelo."""
-        model = joblib.load(self.model_path)
-        cluster_models = joblib.load(self.cluster_model_path)
-        with open(self.model_log_path, "r", encoding="utf-8") as f:
-            model_log = json.load(f)
+        """Carga el modelo, los modelos de clustering y el log del modelo.
+
+        Si USE_S3=true, descarga los artefactos desde S3 en memoria (sin tocar disco).
+        Si USE_S3=false (default), los lee desde disco local — útil para tests sin credenciales AWS.
+        """
+        if USE_S3:
+            s3 = boto3.client("s3")
+
+            buf = io.BytesIO()
+            s3.download_fileobj(S3_BUCKET, "model.pkl", buf)
+            buf.seek(0)
+            model = joblib.load(buf)
+
+            buf = io.BytesIO()
+            s3.download_fileobj(S3_BUCKET, "cluster_models.pkl", buf)
+            buf.seek(0)
+            cluster_models = joblib.load(buf)
+
+            buf = io.BytesIO()
+            s3.download_fileobj(S3_BUCKET, "model_log.json", buf)
+            buf.seek(0)
+            model_log = json.loads(buf.read().decode("utf-8"))
+        else:
+            model = joblib.load(self.model_path)
+            cluster_models = joblib.load(self.cluster_model_path)
+            with open(self.model_log_path, "r", encoding="utf-8") as f:
+                model_log = json.load(f)
         return LoadedArtifacts(model=model, cluster_models=cluster_models, model_log=model_log)
 
     def _build_engine(self):
