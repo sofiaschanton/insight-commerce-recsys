@@ -2,7 +2,7 @@ import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List
+from typing import Any, Dict, List
 
 import joblib
 import numpy as np
@@ -51,7 +51,7 @@ class LoadedArtifacts:
     """Contenedor para los tres artefactos que se cargan al iniciar el servicio."""
     model: object           # Modelo LightGBM entrenado
     cluster_models: Dict[str, object]  # Scalers y KMeans para clusters de usuario y producto
-    model_log: Dict[str, object]       # Metadatos del modelo: feature_cols, n_features, AUC, etc.
+    model_log: Dict[str, Any]       # Metadatos del modelo: feature_cols, n_features, AUC, etc.
 
 
 class RecommendationService:
@@ -81,7 +81,7 @@ class RecommendationService:
         self._artifacts = self._load_artifacts()
         self._engine = self._build_engine()
         # Sobreescribe los metadatos con los valores reales del model_log.json
-        self.model_name = self._artifacts.model_log.get("model_name", self.model_name)
+        self.model_name = str(self._artifacts.model_log.get("model_name", self.model_name))
         self.n_features = int(self._artifacts.model_log.get("n_features", 0))
         self.feature_cols = list(self._artifacts.model_log.get("feature_cols", []))
 
@@ -100,12 +100,12 @@ class RecommendationService:
         Ajusta automáticamente el modo SSL: si el host es local (localhost/127.0.0.1)
         y se pide SSL estricto, lo baja a 'prefer' para evitar errores de conexión.
         """
-        host = (os.getenv("NEON_HOST") or "").strip()
-        sslmode = (os.getenv("NEON_SSLMODE", "require") or "require").strip().lower()
+        host = (os.getenv("AWS_HOST") or "").strip()
+        sslmode = (os.getenv("AWS_SSLMODE", "require") or "require").strip().lower()
 
         if not host:
             raise DatabaseConnectionError(
-                "NEON_HOST no está configurado. Definilo en .env antes de iniciar la API."
+                "AWS_HOST no está configurado. Definilo en .env antes de iniciar la API."
             )
 
         # Si el host es local, SSL estricto no es compatible → bajamos a 'prefer'
@@ -125,11 +125,11 @@ class RecommendationService:
 
         db_url = URL.create(
             drivername="postgresql+psycopg2",
-            username=os.getenv("NEON_USER"),
-            password=os.getenv("NEON_PASSWORD"),
+            username=os.getenv("AWS_USER"),
+            password=os.getenv("AWS_PASSWORD"),
             host=host,
-            port=os.getenv("NEON_PORT", "5432"),
-            database=os.getenv("NEON_DATABASE"),
+            port=int(os.getenv("AWS_PORT", "5432")),
+            database=os.getenv("AWS_DATABASE"),
         )
         return create_engine(
             db_url,
@@ -144,13 +144,14 @@ class RecommendationService:
         con un mensaje claro sobre el host y el modo SSL usado.
         """
         try:
+            assert self._engine is not None, "Engine no inicializado — llamá startup() primero"
             with self._engine.connect() as conn:
                 return pd.read_sql(text(sql), conn, params=params)
         except OperationalError as err:
             # Mensaje adicional para usuarios con Postgres local
             hint = ""
             if self._db_host.lower() in {"localhost", "127.0.0.1", "::1"}:
-                hint = " Para Postgres local, usá NEON_SSLMODE=disable o prefer en .env."
+                hint = " Para Postgres local, usá AWS_SSLMODE=disable o prefer en .env."
 
             raise DatabaseConnectionError(
                 f"No se pudo conectar a PostgreSQL (host={self._db_host}, sslmode={self._db_sslmode}).{hint}"
@@ -426,7 +427,9 @@ class RecommendationService:
 
         # 3. Predice: predict_proba devuelve [prob_clase_0, prob_clase_1]
         #    Tomamos [:, 1] = probabilidad de que el usuario recompre ese producto
-        probabilities = self._artifacts.model.predict_proba(X)[:, 1]
+        import typing
+        model = typing.cast(typing.Any, self._artifacts.model)
+        probabilities = model.predict_proba(X)[:, 1]
         scored = matrix[["product_key"]].copy()
         scored["probability"] = probabilities
         # 4. Ordena de mayor a menor probabilidad y se queda con los top_k

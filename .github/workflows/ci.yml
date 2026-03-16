@@ -1,0 +1,208 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop, 'feature/**', 'fix/**']
+  pull_request:
+    branches: [main, develop]
+  workflow_dispatch:
+  schedule:
+    - cron: '0 8 * * 1'  # Lunes 8am UTC — chequeo semanal de drift
+
+jobs:
+  # ── 1. Tests + tipo-check + SonarCloud ────────────────────────────────────
+  test:
+    name: Tests + Quality (Python 3.10)
+    runs-on: ubuntu-latest
+    if: github.event_name != 'schedule'
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pytest-cov mypy
+
+      - name: Run tests with coverage
+        run: |
+          pytest \
+            --cov=src \
+            --cov-report=xml:coverage.xml \
+            --cov-report=term-missing \
+            -v
+
+      - name: Type check (mypy)
+        run: mypy src/ --ignore-missing-imports --no-strict-optional
+
+      - name: SonarCloud Scan
+        uses: SonarSource/sonarcloud-github-action@master
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+  # ── 2. Chequeo de drift ───────────────────────────────────────────────────
+  drift_check:
+    name: Drift Check
+    runs-on: ubuntu-latest
+    needs: [test]
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'schedule' ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    outputs:
+      drift_detected: ${{ steps.drift.outputs.drift_detected }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run model monitoring
+        env:
+          AWS_HOST: ${{ secrets.AWS_HOST }}
+          AWS_USER: ${{ secrets.AWS_USER }}
+          AWS_PASSWORD: ${{ secrets.AWS_PASSWORD }}
+          AWS_DATABASE: ${{ secrets.AWS_DATABASE }}
+          AWS_PORT: ${{ secrets.AWS_PORT }}
+          AWS_SSLMODE: ${{ secrets.AWS_SSLMODE }}
+        run: python -m src.model_monitoring
+
+      - name: Check drift
+        id: drift
+        run: |
+          if [ ! -f drift_report.json ]; then
+            echo "No drift report found (no reference data available). Skipping retrain."
+            echo "drift_detected=false" >> $GITHUB_OUTPUT
+          else
+            DRIFT=$(python -c "import json; d=json.load(open('drift_report.json')); print(str(d.get('drift_detected', False)).lower())")
+            echo "drift_detected=$DRIFT" >> $GITHUB_OUTPUT
+            echo "Drift detected: $DRIFT"
+          fi
+
+      - name: Upload drift report
+        if: steps.drift.outputs.drift_detected == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: drift-report-${{ github.run_id }}
+          path: drift_report.json
+          retention-days: 30
+          if-no-files-found: ignore
+
+      - name: Create GitHub Issue for drift
+        if: steps.drift.outputs.drift_detected == 'true'
+        run: |
+          PSI=$(python -c "import json; d=json.load(open('drift_report.json')); print(d['psi'])")
+          KS=$(python -c "import json; d=json.load(open('drift_report.json')); print(d['ks'])")
+          DATE=$(date -u +%Y-%m-%d)
+
+          curl -s -o /dev/null -X POST \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${{ github.repository }}/labels" \
+            -d '{"name":"data-drift","color":"e4e669","description":"Data drift detectado en chequeo semanal"}' || true
+
+          curl -X POST \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${{ github.repository }}/issues" \
+            -d "{
+              \"title\": \"[drift] Data drift detectado — ${DATE}\",
+              \"body\": \"## Reporte de drift semanal\\n\\nSe detectó drift significativo en el chequeo automático del **${DATE}**.\\n\\n| Metrica | Valor | Umbral |\\n|---|---|---|\\n| PSI (promedio) | ${PSI} | >= 0.25 |\\n| KS (promedio) | ${KS} | >= 0.30 |\\n\\nEl job \`retrain\` fue disparado automáticamente via \`workflow_dispatch\`.\\n\\n**Acciones recomendadas:**\\n- Revisar el artefacto \`drift-report-${{ github.run_id }}\` en este workflow.\\n- Verificar si hay cambios estacionales, de catálogo o de comportamiento de compra que expliquen el drift.\\n- Confirmar que el reentrenamiento completó sin rollback.\",
+              \"labels\": [\"data-drift\"]
+            }"
+
+  # ── 3. Validación del feature matrix ─────────────────────────────────────
+  data-validation:
+    name: Data Validation
+    runs-on: ubuntu-latest
+    needs: [drift_check]
+    if: >
+      needs.drift_check.outputs.drift_detected == 'true' ||
+      github.event_name == 'workflow_dispatch'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run data validation
+        run: python -m src.data.validate_data --output-dir reports/data
+
+      - name: Upload validation report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: validation-report-${{ github.run_id }}
+          path: reports/data/validation_report.json
+          retention-days: 7
+
+  # ── 4. Reentrenamiento ────────────────────────────────────────────────────
+  retrain:
+    name: Retrain Model (drift-gated)
+    runs-on: ubuntu-latest
+    needs: [data-validation]
+    if: >
+      needs.drift_check.outputs.drift_detected == 'true' ||
+      github.event_name == 'workflow_dispatch'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run pipeline (Optuna 50 trials)
+        env:
+          AWS_HOST: ${{ secrets.AWS_HOST }}
+          AWS_USER: ${{ secrets.AWS_USER }}
+          AWS_PASSWORD: ${{ secrets.AWS_PASSWORD }}
+          AWS_DATABASE: ${{ secrets.AWS_DATABASE }}
+          AWS_PORT: ${{ secrets.AWS_PORT }}
+          MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
+        run: |
+          python -m src.pipeline --trials 50 || {
+            echo "::error::Pipeline falló. Si es por rollback, el modelo anterior sigue activo."
+            exit 1
+          }
+
+      - name: Upload model artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: model-artifacts-${{ github.run_id }}
+          path: |
+            models/model.pkl
+            models/cluster_models.pkl
+            models/model_log.json
+          retention-days: 30
