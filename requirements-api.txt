@@ -1,0 +1,29 @@
+# =============================================================================
+# requirements.txt — Insight Commerce · Recsys API
+# Versiones fijadas para reproducibilidad entre builds de CI/CD y en Fargate.
+# Actualizar con: pip-compile requirements.in (si se usa pip-tools)
+# =============================================================================
+
+# ── Web framework ─────────────────────────────────────────────────────────────
+fastapi==0.115.5          # Framework ASGI; incluye Starlette y Pydantic v2
+uvicorn==0.32.1 # Servidor ASGI con soporte para websockets y reload
+
+# ── AWS SDK ───────────────────────────────────────────────────────────────────
+boto3==1.35.71            # SDK AWS; se usa para descargar artefactos desde S3
+
+# ── Base de datos ─────────────────────────────────────────────────────────────
+sqlalchemy==2.0.36        # ORM / query builder; se usa con text() + read_sql()
+psycopg2-binary==2.9.10   # Driver PostgreSQL para SQLAlchemy
+# Nota: psycopg2-binary incluye libpq compilada estáticamente.
+# En el Dockerfile usamos psycopg2-binary para simplificar el build;
+# en producción con compilación nativa se puede cambiar a psycopg2==2.9.10.
+
+# ── Data & ML ─────────────────────────────────────────────────────────────────
+pandas==2.2.3             # Manipulación de DataFrames en el pipeline de features
+numpy==1.26.4             # Operaciones numéricas (dependencia transitiva de pandas/sklearn)
+scikit-learn==1.5.2       # Scaler + KMeans para clustering de usuarios y productos
+joblib==1.4.2             # Serialización/deserialización de modelos (.pkl)
+lightgbm==4.5.0           # Modelo de gradiente boosting para predicción de recompra
+
+# ── Validación ────────────────────────────────────────────────────────────────
+pydantic==2.9.2           # Validación de schemas de entrada/salida (incluido en fastapi)
