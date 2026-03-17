@@ -1,0 +1,89 @@
+# =============================================================================
+# .dockerignore — Insight Commerce · Recsys API
+# Excluye archivos innecesarios del contexto de build de Docker.
+# Reduce el tamaño del contexto enviado al daemon y evita filtrar
+# credenciales o artefactos de desarrollo dentro de la imagen.
+# =============================================================================
+
+# ── Credenciales y configuración local ───────────────────────────────────────
+.env
+.env.*
+*.env
+.aws/
+
+# ── Artefactos de modelo (se descargan desde S3 en runtime; no van en la imagen)
+models/
+*.pkl
+*.joblib
+*.json
+# Excepción: si hubiera un pyproject.toml o setup.cfg en la raíz, no excluirlos.
+# Los .json de configuración del proyecto deben listarse explícitamente si se necesitan.
+
+# ── Cache de Python ───────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ── Entornos virtuales ────────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ── Notebooks y exploración ───────────────────────────────────────────────────
+notebooks/
+*.ipynb
+.ipynb_checkpoints/
+
+# ── Datos crudos y procesados (nunca deben estar en la imagen) ────────────────
+data/
+*.csv
+*.parquet
+*.feather
+*.xlsx
+
+# ── Logs locales ──────────────────────────────────────────────────────────────
+logs/
+*.log
+reports/
+
+# ── Tests ─────────────────────────────────────────────────────────────────────
+tests/
+test_*
+*_test.py
+pytest.ini
+setup.cfg
+tox.ini
+.coverage
+htmlcov/
+
+# ── Control de versiones ──────────────────────────────────────────────────────
+.git/
+.gitignore
+.gitattributes
+
+# ── Documentación ─────────────────────────────────────────────────────────────
+docs/
+*.md
+LICENSE
+
+# ── IDEs y editores ───────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+.DS_Store
+Thumbs.db
+
+# ── CI/CD y configuración de infraestructura ─────────────────────────────────
+.github/
+terraform/
+*.tf
+*.tfvars
+docker-compose*.yml
+Makefile
+

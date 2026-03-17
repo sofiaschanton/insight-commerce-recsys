@@ -1,200 +1,397 @@
-import io
+"""
+inference.py — Insight Commerce · Recsys API
+Entorno destino: AWS Fargate (ECS) + S3 + RDS PostgreSQL
+Autenticación  : IAM Task Role (ecsTaskRole.InsightCommerce) — sin hardcoded keys
+Artefactos     : descargados desde S3 a /tmp/ al iniciar el contenedor
+
+Cambios en esta versión (production-ready):
+  - Try/except granular por archivo en _download_artifacts_from_s3():
+    si falla la descarga de model.pkl se loguea exactamente qué archivo y por qué.
+  - Variables de entorno de RDS estandarizadas: DB_HOST, DB_USER, DB_PASSWORD, DB_NAME.
+  - Acceso explícito a cluster_models.pkl: cada clave del dict se asigna
+    individualmente a atributos tipados para detectar KeyError en startup.
+  - Sin Path(__file__), sin load_dotenv(), sin rutas locales de modelos.
+"""
+
 import json
+import logging
 import os
+import sys
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Dict, List
 
 import boto3
 import joblib
-import numpy as np
 import pandas as pd
-from dotenv import load_dotenv
+from botocore.exceptions import BotoCoreError, ClientError
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import URL
 from sqlalchemy.exc import OperationalError
 
 from src.features.feature_engineering import (
     _normalize_dim_product,
+    get_user_aisle_feature,
     get_user_department_feature,
     get_user_features,
     get_user_product_features,
-    get_user_aisle_feature,
 )
-from src.models.train import PRODUCT_CLUSTER_FEATURES, USER_CLUSTER_FEATURES
+
+# Features base para K-Means de usuario
+USER_CLUSTER_FEATURES = [
+    "user_total_orders",
+    "user_avg_basket_size",
+    "user_days_since_last_order",
+    "user_reorder_ratio",
+    "user_distinct_products",
+]
+
+# Features base para K-Means de producto
+PRODUCT_CLUSTER_FEATURES = [
+    "product_total_purchases",
+    "product_reorder_rate",
+    "product_avg_add_to_cart",
+    "product_unique_users",
+    "p_department_reorder_rate",
+]
+
+logger = logging.getLogger("api")
+
+# ---------------------------------------------------------------------------
+# Configuración S3 — exclusivamente desde variables de entorno del sistema.
+# Definidas en la ECS Task Definition; nunca en código ni en archivos locales.
+# ---------------------------------------------------------------------------
+S3_BUCKET: str = os.environ["S3_BUCKET"]          # Obligatorio — falla rápido si falta
+S3_PREFIX: str = os.getenv("S3_PREFIX", "models") # Prefijo dentro del bucket (ej. "models/v2")
+
+# /tmp/ es el ÚNICO directorio escribible en el sistema de archivos de Fargate.
+# Todos los artefactos descargados desde S3 se almacenan aquí.
+_TMP               = "/tmp"
+_MODEL_LOCAL       = f"{_TMP}/model.pkl"
+_CLUSTER_LOCAL     = f"{_TMP}/cluster_models.pkl"
+_MODEL_LOG_LOCAL   = f"{_TMP}/model_log.json"
+
+# Mínimo de órdenes prior para aplicar el modelo ML completo.
+# Por debajo de este umbral se activa el cold-start (ranking por frecuencia personal).
+MIN_ORDERS_FOR_MODEL = 5
 
 
-# Directorio raíz del proyecto (dos niveles arriba de este archivo)
-ROOT_DIR = Path(__file__).resolve().parents[2]
-# Carga las variables de entorno desde el archivo .env (credenciales de DB, rutas de modelos, etc.)
-load_dotenv(ROOT_DIR / ".env")
-
-S3_BUCKET = os.getenv("S3_BUCKET", "insight-commerce-artifacts")
-USE_S3 = os.getenv("USE_S3", "false").lower() == "true"
-
-
-# --- Excepciones personalizadas ---
-# Se usan para diferenciar tipos de error y devolver el código HTTP correcto en la API
+# ---------------------------------------------------------------------------
+# Excepciones de dominio
+# ---------------------------------------------------------------------------
 
 class UserNotFoundError(Exception):
-    """Se lanza cuando el user_id no tiene ningún historial en la base de datos (0 órdenes prior)."""
-    pass
+    """El user_id no tiene historial prior en RDS (0 órdenes prior)."""
 
 
 class FeatureContractError(Exception):
-    """Se lanza cuando la matriz de features no coincide con lo que espera el modelo entrenado."""
-    pass
+    """La matriz de features no coincide con el contrato del modelo entrenado."""
 
 
 class DatabaseConnectionError(Exception):
-    """Se lanza cuando no se puede conectar a PostgreSQL."""
-    pass
+    """No fue posible establecer conexión con PostgreSQL en RDS."""
 
 
-# Mínimo de órdenes prior que un usuario necesita para que el modelo ML sea aplicable.
-# Usuarios con menos órdenes reciben un ranking de popularidad personal (cold-start fallback).
-MIN_ORDERS_FOR_MODEL = 5
+# ---------------------------------------------------------------------------
+# Contenedor de artefactos con tipado explícito de claves de cluster_models
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _ClusterArtifacts:
+    """Desempaqueta las claves del dict cluster_models.pkl con tipado explícito.
+
+    Al asignar cada clave en el constructor se obtiene un KeyError descriptivo
+    en startup si el pkl no tiene la estructura esperada, en lugar de un
+    AttributeError críptico durante la primera inferencia en producción.
+    """
+    scaler_user:      Any  # StandardScaler ajustado sobre USER_CLUSTER_FEATURES
+    kmeans_user:      Any  # KMeans entrenado sobre perfiles de usuario
+    user_profiles:    Any  # DataFrame / índice de referencia de usuarios conocidos
+    scaler_product:   Any  # StandardScaler ajustado sobre PRODUCT_CLUSTER_FEATURES
+    kmeans_product:   Any  # KMeans entrenado sobre perfiles de producto
+    product_profiles: Any  # DataFrame / índice de referencia de productos conocidos
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "_ClusterArtifacts":
+        """Construye la instancia desde el dict cargado de cluster_models.pkl.
+
+        Lanza KeyError con el nombre exacto de la clave faltante si el pkl
+        no tiene la estructura esperada — falla en startup, no en inferencia.
+        """
+        required_keys = [
+            "scaler_user", "kmeans_user", "user_profiles",
+            "scaler_product", "kmeans_product", "product_profiles",
+        ]
+        missing = [k for k in required_keys if k not in d]
+        if missing:
+            raise KeyError(
+                f"cluster_models.pkl no contiene las claves requeridas: {missing}. "
+                f"Claves presentes: {list(d.keys())}"
+            )
+        return cls(
+            scaler_user      = d["scaler_user"],
+            kmeans_user      = d["kmeans_user"],
+            user_profiles    = d["user_profiles"],
+            scaler_product   = d["scaler_product"],
+            kmeans_product   = d["kmeans_product"],
+            product_profiles = d["product_profiles"],
+        )
 
 
 @dataclass
 class LoadedArtifacts:
-    """Contenedor para los tres artefactos que se cargan al iniciar el servicio."""
-    model: object           # Modelo LightGBM entrenado
-    cluster_models: Dict[str, object]  # Scalers y KMeans para clusters de usuario y producto
-    model_log: Dict[str, Any]       # Metadatos del modelo: feature_cols, n_features, AUC, etc.
+    """Agrupa los tres artefactos cargados desde S3 al inicio del servicio."""
+    model:    Any               # Modelo LightGBM serializado con joblib
+    clusters: _ClusterArtifacts # Scalers + KMeans con tipado explícito
+    model_log: Dict[str, Any]   # Metadatos: feature_cols, n_features, AUC, etc.
 
+
+# ---------------------------------------------------------------------------
+# Servicio principal
+# ---------------------------------------------------------------------------
 
 class RecommendationService:
-    """Servicio principal que orquesta la inferencia de recomendaciones next-basket."""
+    """Orquesta la descarga desde S3, la conexión a RDS y la inferencia."""
 
     def __init__(self) -> None:
-        # Rutas a los archivos de modelo (configurables por variables de entorno)
-        self.model_path = Path(os.getenv("API_MODEL_PATH", "models/model.pkl"))
-        self.cluster_model_path = Path(
-            os.getenv("API_CLUSTER_MODEL_PATH", "models/cluster_models.pkl")
-        )
-        self.model_log_path = Path(os.getenv("API_MODEL_LOG_PATH", "models/model_log.json"))
-
-        # Metadatos del modelo (se llenan en startup)
-        self.model_name = "LightGBM optimizado"
-        self.n_features = 0
+        # Metadatos del modelo — se populan en startup() tras leer model_log.json
+        self.model_name: str  = "LightGBM"
+        self.n_features: int  = 0
         self.feature_cols: List[str] = []
 
-        # Conexión a la base de datos y cache de artefactos (se inicializan en startup)
-        self._engine = None
-        self._db_host = ""      # Host de la DB (se guarda para mensajes de error)
-        self._db_sslmode = ""   # Modo SSL efectivo que se usó al conectar
+        # Estado interno — se inicializan en startup()
+        self.engine   = None    # Expuesto como atributo público para el health check de RDS
+        self._db_host: str     = ""
+        self._db_sslmode: str  = ""
         self._artifacts: LoadedArtifacts | None = None
 
+    # ------------------------------------------------------------------
+    # Startup
+    # ------------------------------------------------------------------
+
     def startup(self) -> None:
-        """Se ejecuta una sola vez al iniciar la API. Carga modelos y abre la conexión a la DB."""
-        self._artifacts = self._load_artifacts()
-        self._engine = self._build_engine()
-        # Sobreescribe los metadatos con los valores reales del model_log.json
-        self.model_name = str(self._artifacts.model_log.get("model_name", self.model_name))
-        self.n_features = int(self._artifacts.model_log.get("n_features", 0))
+        """Carga artefactos desde S3 y abre el pool de conexiones a RDS.
+
+        Orden de operaciones:
+          1. Descarga los tres artefactos de S3 a /tmp/ (con try/except granular)
+          2. Los carga en memoria y desempaqueta cluster_models con tipado explícito
+          3. Abre el pool de conexiones a RDS PostgreSQL
+          4. Sincroniza metadatos desde model_log.json
+
+        Si cualquier paso falla, el proceso arroja una excepción que Fargate/ECS
+        registra en CloudWatch y reinicia la tarea automáticamente.
+        """
+        self._artifacts = self._download_and_load_artifacts()
+        self.engine     = self._build_engine()
+
+        self.model_name   = str(self._artifacts.model_log.get("model_name",  self.model_name))
+        self.n_features   = int(self._artifacts.model_log.get("n_features",  0))
         self.feature_cols = list(self._artifacts.model_log.get("feature_cols", []))
 
-    def _load_artifacts(self) -> LoadedArtifacts:
-        """Carga el modelo, los modelos de clustering y el log del modelo.
+        logger.info(
+            "startup OK | model=%s | n_features=%d | bucket=%s | prefix=%s",
+            self.model_name, self.n_features, S3_BUCKET, S3_PREFIX,
+        )
 
-        Si USE_S3=true, descarga los artefactos desde S3 en memoria (sin tocar disco).
-        Si USE_S3=false (default), los lee desde disco local — útil para tests sin credenciales AWS.
+    # ------------------------------------------------------------------
+    # Descarga de artefactos desde S3
+    # ------------------------------------------------------------------
+
+    def _s3_key(self, filename: str) -> str:
+        """Construye la clave S3: prefijo/filename o solo filename si el prefijo está vacío."""
+        return f"{S3_PREFIX}/{filename}" if S3_PREFIX else filename
+
+    def _download_and_load_artifacts(self) -> LoadedArtifacts:
+        """Descarga los tres artefactos desde S3 a /tmp/ y los carga en memoria.
+
+        Try/except granular por archivo:
+          - Cada descarga está aislada en su propio bloque.
+          - Si falla, el log en CloudWatch indica EXACTAMENTE qué archivo falló
+            y la causa (permisos IAM, nombre incorrecto, bucket inexistente, etc.).
+          - La excepción se re-lanza para que Fargate reinicie la tarea.
+
+        boto3 obtiene credenciales automáticamente desde el IAM Task Role
+        (ecsTaskRole.InsightCommerce) vía el metadata endpoint de ECS (169.254.170.2).
+        No se pasa ninguna access_key ni secret_key en el código.
         """
-        if USE_S3:
-            s3 = boto3.client("s3")
+        s3 = boto3.client("s3")  # Credenciales del Task Role — sin hardcoding
 
-            buf = io.BytesIO()
-            s3.download_fileobj(S3_BUCKET, "model.pkl", buf)
-            buf.seek(0)
-            model = joblib.load(buf)
+        artifacts_to_download = [
+            ("model.pkl",          _MODEL_LOCAL),
+            ("cluster_models.pkl", _CLUSTER_LOCAL),
+            ("model_log.json",     _MODEL_LOG_LOCAL),
+        ]
 
-            buf = io.BytesIO()
-            s3.download_fileobj(S3_BUCKET, "cluster_models.pkl", buf)
-            buf.seek(0)
-            cluster_models = joblib.load(buf)
+        for filename, local_path in artifacts_to_download:
+            s3_key = self._s3_key(filename)
+            try:
+                logger.info(
+                    "S3 download | bucket=%s | key=%s → %s",
+                    S3_BUCKET, s3_key, local_path,
+                )
+                s3.download_file(S3_BUCKET, s3_key, local_path)
+                logger.info("S3 download OK | %s", local_path)
 
-            buf = io.BytesIO()
-            s3.download_fileobj(S3_BUCKET, "model_log.json", buf)
-            buf.seek(0)
-            model_log = json.loads(buf.read().decode("utf-8"))
-        else:
-            model = joblib.load(self.model_path)
-            cluster_models = joblib.load(self.cluster_model_path)
-            with open(self.model_log_path, "r", encoding="utf-8") as f:
-                model_log = json.load(f)
-        return LoadedArtifacts(model=model, cluster_models=cluster_models, model_log=model_log)
+            except ClientError as err:
+                # ClientError cubre: NoSuchKey, NoSuchBucket, AccessDenied, etc.
+                error_code = err.response.get("Error", {}).get("Code", "UNKNOWN")
+                error_msg  = err.response.get("Error", {}).get("Message", str(err))
+                logger.critical(
+                    "S3 download FAILED | bucket=%s | key=%s | "
+                    "error_code=%s | message=%s | "
+                    "Verificar: (1) el archivo existe en S3, "
+                    "(2) ecsTaskRole.InsightCommerce tiene s3:GetObject sobre el bucket.",
+                    S3_BUCKET, s3_key, error_code, error_msg,
+                )
+                raise  # Re-lanza para que ECS registre el Exit Code y reinicie la tarea
+
+            except BotoCoreError as err:
+                # BotoCoreError: errores de red, timeout, credenciales no resueltas
+                logger.critical(
+                    "S3 download FAILED (network/credentials) | bucket=%s | key=%s | %s | "
+                    "Verificar: (1) el Task Role tiene s3:GetObject, "
+                    "(2) el contenedor puede alcanzar el endpoint de S3 (VPC endpoint o NAT).",
+                    S3_BUCKET, s3_key, err,
+                )
+                raise
+
+            except OSError as err:
+                # OSError: no se puede escribir en local_path (no debería ocurrir con /tmp/)
+                logger.critical(
+                    "S3 download FAILED (write error) | local_path=%s | %s | "
+                    "Asegúrate de que local_path está bajo /tmp/ (único dir escribible en Fargate).",
+                    local_path, err,
+                )
+                raise
+
+        # --- Carga en memoria ---
+        logger.info("Cargando artefactos en memoria desde /tmp/...")
+
+        model = joblib.load(_MODEL_LOCAL)
+        logger.info("model.pkl cargado | tipo=%s", type(model).__name__)
+
+        raw_cluster_dict = joblib.load(_CLUSTER_LOCAL)
+        # Desempaqueta con tipado explícito — lanza KeyError si falta alguna clave
+        clusters = _ClusterArtifacts.from_dict(raw_cluster_dict)
+        logger.info(
+            "cluster_models.pkl cargado | "
+            "scaler_user=%s | kmeans_user=%s | scaler_product=%s | kmeans_product=%s",
+            type(clusters.scaler_user).__name__,
+            type(clusters.kmeans_user).__name__,
+            type(clusters.scaler_product).__name__,
+            type(clusters.kmeans_product).__name__,
+        )
+
+        with open(_MODEL_LOG_LOCAL, "r", encoding="utf-8") as fh:
+            model_log = json.load(fh)
+        logger.info(
+            "model_log.json cargado | n_features=%s | feature_cols_count=%d",
+            model_log.get("n_features", "N/A"),
+            len(model_log.get("feature_cols", [])),
+        )
+
+        return LoadedArtifacts(model=model, clusters=clusters, model_log=model_log)
+
+    # ------------------------------------------------------------------
+    # Conexión a RDS PostgreSQL
+    # ------------------------------------------------------------------
 
     def _build_engine(self):
-        """Crea el engine de SQLAlchemy para conectarse a PostgreSQL.
+        """Crea el engine de SQLAlchemy apuntando a RDS PostgreSQL.
 
-        Lee las credenciales desde variables de entorno (.env).
-        Ajusta automáticamente el modo SSL: si el host es local (localhost/127.0.0.1)
-        y se pide SSL estricto, lo baja a 'prefer' para evitar errores de conexión.
+        Variables de entorno estandarizadas (definidas en la Task Definition de ECS):
+          DB_HOST     — endpoint del cluster RDS (obligatorio)
+          DB_PORT     — puerto (default: 5432)
+          DB_USER     — usuario de la base de datos (obligatorio)
+          DB_PASSWORD — contraseña (obligatorio; usar Secrets Manager en producción)
+          DB_NAME     — nombre de la base de datos (obligatorio)
+          DB_SSLMODE  — modo SSL (default: "require"; Fargate → RDS siempre require)
+
+        Ajuste automático de sslmode:
+          Fargate → RDS: "require" es válido y recomendado siempre.
+          localhost / 127.0.0.1: se baja a "prefer" para evitar errores de certificado
+          en entornos de desarrollo local.
         """
-        host = (os.getenv("AWS_HOST") or "").strip()
-        sslmode = (os.getenv("AWS_SSLMODE", "require") or "require").strip().lower()
-
+        host = (os.environ.get("DB_HOST") or "").strip()
         if not host:
             raise DatabaseConnectionError(
-                "AWS_HOST no está configurado. Definilo en .env antes de iniciar la API."
+                "DB_HOST no está configurado. "
+                "Definir la variable en la ECS Task Definition antes de desplegar."
             )
 
-        # Si el host es local, SSL estricto no es compatible → bajamos a 'prefer'
+        sslmode = (os.environ.get("DB_SSLMODE", "require") or "require").strip().lower()
         local_hosts = {"localhost", "127.0.0.1", "::1"}
-        is_local_host = host.lower() in local_hosts
-        if is_local_host and sslmode in {"require", "verify-ca", "verify-full"}:
+        if host.lower() in local_hosts and sslmode in {"require", "verify-ca", "verify-full"}:
             sslmode = "prefer"
+            logger.warning(
+                "Host local detectado (%s); sslmode bajado automáticamente a 'prefer'.", host
+            )
 
-        # Validación: si el valor de sslmode no es conocido, usar 'require' como fallback seguro
         valid_sslmodes = {"disable", "allow", "prefer", "require", "verify-ca", "verify-full"}
         if sslmode not in valid_sslmodes:
+            logger.warning("sslmode='%s' no reconocido; usando 'require'.", sslmode)
             sslmode = "require"
 
-        # Guardamos host y sslmode para poder incluirlos en mensajes de error posteriores
-        self._db_host = host
+        self._db_host    = host
         self._db_sslmode = sslmode
 
-        db_url = URL.create(
-            drivername="postgresql+psycopg2",
-            username=os.getenv("AWS_USER"),
-            password=os.getenv("AWS_PASSWORD"),
-            host=host,
-            port=int(os.getenv("AWS_PORT", "5432")),
-            database=os.getenv("AWS_DATABASE"),
-        )
-        return create_engine(
+        # Claves obligatorias — os.environ[] lanza KeyError inmediato si faltan
+        try:
+            db_url = URL.create(
+                drivername="postgresql+psycopg2",
+                username=os.environ["DB_USER"],
+                password=os.environ["DB_PASSWORD"],
+                host=host,
+                port=int(os.environ.get("DB_PORT", "5432")),
+                database=os.environ["DB_NAME"],
+            )
+        except KeyError as err:
+            raise DatabaseConnectionError(
+                f"Variable de entorno de RDS faltante: {err}. "
+                "Definir DB_USER, DB_PASSWORD y DB_NAME en la Task Definition."
+            ) from err
+
+        engine = create_engine(
             db_url,
             connect_args={"connect_timeout": 10, "sslmode": sslmode},
-            pool_pre_ping=True,  # Verifica la conexión antes de cada uso (evita conexiones muertas)
+            pool_pre_ping=True,   # Verifica la conexión antes de cada uso
+            pool_size=5,          # Conexiones permanentes en el pool
+            max_overflow=10,      # Conexiones adicionales bajo picos de tráfico
         )
+        logger.info(
+            "Engine RDS creado | host=%s | port=%s | db=%s | sslmode=%s",
+            host,
+            os.environ.get("DB_PORT", "5432"),
+            os.environ.get("DB_NAME", "?"),
+            sslmode,
+        )
+        return engine
+
+    # ------------------------------------------------------------------
+    # Helpers SQL internos
+    # ------------------------------------------------------------------
 
     def _read_sql(self, sql: str, params: dict | None = None) -> pd.DataFrame:
-        """Ejecuta una query SQL parametrizada y devuelve el resultado como DataFrame.
+        """Ejecuta SQL parametrizado y devuelve DataFrame.
 
-        Captura errores de conexión de SQLAlchemy y los convierte en DatabaseConnectionError
-        con un mensaje claro sobre el host y el modo SSL usado.
+        Convierte OperationalError de SQLAlchemy en DatabaseConnectionError
+        para que la capa HTTP retorne 503 en lugar de un 500 genérico.
         """
+        assert self.engine is not None, "Engine no inicializado — llamar startup() primero."
         try:
-            assert self._engine is not None, "Engine no inicializado — llamá startup() primero"
-            with self._engine.connect() as conn:
+            with self.engine.connect() as conn:
                 return pd.read_sql(text(sql), conn, params=params)
         except OperationalError as err:
-            # Mensaje adicional para usuarios con Postgres local
-            hint = ""
-            if self._db_host.lower() in {"localhost", "127.0.0.1", "::1"}:
-                hint = " Para Postgres local, usá AWS_SSLMODE=disable o prefer en .env."
-
+            hint = (
+                " Para Postgres local usa DB_SSLMODE=disable en las variables de entorno."
+                if self._db_host.lower() in {"localhost", "127.0.0.1", "::1"}
+                else ""
+            )
             raise DatabaseConnectionError(
-                f"No se pudo conectar a PostgreSQL (host={self._db_host}, sslmode={self._db_sslmode}).{hint}"
+                f"No se pudo conectar a PostgreSQL "
+                f"(host={self._db_host}, sslmode={self._db_sslmode}).{hint}"
             ) from err
 
     def _query_user_prior(self, user_id: int) -> pd.DataFrame:
-        """Trae todo el historial de compras previas (get_eval='prior') del usuario.
-
-        Estos datos son la base para calcular todas las features del usuario y
-        de los pares usuario-producto.
-        """
         sql = """
             SELECT user_key, product_key, order_key, order_number,
                    days_since_prior_order, reordered, add_to_cart_order, get_eval
@@ -204,11 +401,6 @@ class RecommendationService:
         return self._read_sql(sql, {"user_id": user_id})
 
     def _query_user_dim_product(self, product_keys: List[int]) -> pd.DataFrame:
-        """Trae el nombre, departamento y pasillo de una lista de productos.
-
-        Se usa tanto para construir features categoricas como para enriquecer
-        la respuesta final con el nombre del producto.
-        """
         sql = """
             SELECT product_key, product_name, department_name, aisle_name
             FROM dim_product
@@ -217,15 +409,7 @@ class RecommendationService:
         return self._read_sql(sql, {"product_keys": product_keys})
 
     def _query_product_features(self, product_keys: List[int]) -> pd.DataFrame:
-        """Calcula features estadísticas de los productos directamente en la base de datos.
-
-        Usa CTEs para calcular en paralelo:
-        - product_stats: total de compras, tasa de recompra, posición promedio en el carrito
-        - department_stats: tasa de recompra promedio del departamento del producto
-        - aisle_stats: tasa de recompra promedio del pasillo del producto
-
-        Solo se consultan los productos que ya compró el usuario (product_keys).
-        """
+        """Calcula features estadísticas de productos directamente en RDS con CTEs."""
         sql = """
             WITH selected_products AS (
                 SELECT product_key, department_name, aisle_name
@@ -235,53 +419,45 @@ class RecommendationService:
             product_stats AS (
                 SELECT
                     f.product_key,
-                    COUNT(f.order_key)::int AS product_total_purchases,
-                    AVG(f.reordered::float) AS product_reorder_rate,
-                    AVG(f.add_to_cart_order::float) AS product_avg_add_to_cart,
-                    COUNT(DISTINCT f.user_key)::int AS product_unique_users
+                    COUNT(f.order_key)::int            AS product_total_purchases,
+                    AVG(f.reordered::float)            AS product_reorder_rate,
+                    AVG(f.add_to_cart_order::float)    AS product_avg_add_to_cart,
+                    COUNT(DISTINCT f.user_key)::int    AS product_unique_users
                 FROM fact_order_products f
                 WHERE f.get_eval = 'prior' AND f.product_key = ANY(:product_keys)
                 GROUP BY f.product_key
             ),
             department_stats AS (
-                SELECT
-                    p.department_name,
-                    AVG(f.reordered::float) AS p_department_reorder_rate
+                SELECT p.department_name,
+                       AVG(f.reordered::float) AS p_department_reorder_rate
                 FROM fact_order_products f
                 JOIN dim_product p ON p.product_key = f.product_key
                 WHERE f.get_eval = 'prior'
                 GROUP BY p.department_name
             ),
             aisle_stats AS (
-                SELECT
-                    p.aisle_name,
-                    AVG(f.reordered::float) AS p_aisle_reorder_rate
+                SELECT p.aisle_name,
+                       AVG(f.reordered::float) AS p_aisle_reorder_rate
                 FROM fact_order_products f
                 JOIN dim_product p ON p.product_key = f.product_key
                 WHERE f.get_eval = 'prior'
                 GROUP BY p.aisle_name
             )
-            SELECT
-                s.product_key,
-                ps.product_total_purchases,
-                ps.product_reorder_rate,
-                ps.product_avg_add_to_cart,
-                ps.product_unique_users,
-                ds.p_department_reorder_rate,
-                ais.p_aisle_reorder_rate
+            SELECT s.product_key,
+                   ps.product_total_purchases,
+                   ps.product_reorder_rate,
+                   ps.product_avg_add_to_cart,
+                   ps.product_unique_users,
+                   ds.p_department_reorder_rate,
+                   ais.p_aisle_reorder_rate
             FROM selected_products s
-            LEFT JOIN product_stats ps ON ps.product_key = s.product_key
-            LEFT JOIN department_stats ds ON ds.department_name = s.department_name
-            LEFT JOIN aisle_stats ais ON ais.aisle_name = s.aisle_name
+            LEFT JOIN product_stats    ps  ON ps.product_key     = s.product_key
+            LEFT JOIN department_stats ds  ON ds.department_name = s.department_name
+            LEFT JOIN aisle_stats      ais ON ais.aisle_name     = s.aisle_name
         """
         return self._read_sql(sql, {"product_keys": product_keys})
 
     def _query_user_order_count(self, user_id: int) -> int:
-        """Devuelve la cantidad de órdenes prior distintas del usuario.
-
-        Retorna 0 si el usuario no existe en la tabla o no tiene historial prior.
-        Se usa antes de entrar al pipeline de features para decidir si aplicar cold-start.
-        """
         sql = """
             SELECT COUNT(DISTINCT order_key) AS n_orders
             FROM fact_order_products
@@ -290,14 +466,12 @@ class RecommendationService:
         result = self._read_sql(sql, {"user_id": user_id})
         return int(result["n_orders"].iloc[0]) if not result.empty else 0
 
-    def _cold_start_top_products(self, user_id: int, top_k: int) -> List[dict]:
-        """Devuelve los top_k productos más comprados por el usuario como fallback cold-start.
+    # ------------------------------------------------------------------
+    # Cold-start fallback
+    # ------------------------------------------------------------------
 
-        Se usa cuando el usuario tiene menos de MIN_ORDERS_FOR_MODEL órdenes y no hay
-        suficiente historial para construir el feature set completo del modelo.
-        La 'probability' es la frecuencia de compra normalizada por órdenes totales
-        (cuántas de sus órdenes incluyeron ese producto), expresada entre 0 y 1.
-        """
+    def _cold_start_top_products(self, user_id: int, top_k: int) -> List[dict]:
+        """Ranking por frecuencia personal cuando el historial es insuficiente."""
         sql = """
             WITH user_stats AS (
                 SELECT COUNT(DISTINCT order_key) AS n_orders
@@ -312,254 +486,211 @@ class RecommendationService:
                 ORDER BY purchase_count DESC
                 LIMIT :top_k
             )
-            SELECT
-                pc.product_key,
-                pc.purchase_count,
-                ROUND(pc.purchase_count::numeric / us.n_orders, 4) AS probability
+            SELECT pc.product_key,
+                   pc.purchase_count,
+                   ROUND(pc.purchase_count::numeric / us.n_orders, 4) AS probability
             FROM product_counts pc
             CROSS JOIN user_stats us
         """
         top = self._read_sql(sql, {"user_id": user_id, "top_k": top_k})
-
         if top.empty:
             return []
 
-        # Enriquece con el nombre del producto
-        product_keys = top["product_key"].astype(int).tolist()
-        product_names = (
-            self._query_user_dim_product(product_keys)
-            .loc[:, ["product_key", "product_name"]]
+        names = (
+            self._query_user_dim_product(top["product_key"].astype(int).tolist())
+            [["product_key", "product_name"]]
             .drop_duplicates(subset=["product_key"])
         )
-        top = top.merge(product_names, on="product_key", how="left")
-
+        top = top.merge(names, on="product_key", how="left")
         return [
             {
-                "product_key": int(row.product_key),
+                "product_key":  int(row.product_key),
                 "product_name": None if pd.isna(row.product_name) else str(row.product_name),
-                "probability": float(row.probability),
+                "probability":  float(row.probability),
             }
             for row in top.itertuples(index=False)
         ]
+
+    # ------------------------------------------------------------------
+    # Asignación de clusters (usa _ClusterArtifacts con atributos tipados)
+    # ------------------------------------------------------------------
 
     @staticmethod
     def _assign_user_cluster(
         matrix: pd.DataFrame,
         user_id: int,
-        scaler_user,
-        kmeans_user,
-        user_profiles_ref: pd.DataFrame,
+        clusters: _ClusterArtifacts,
     ) -> pd.DataFrame:
-        """Asigna el cluster de comportamiento del usuario usando KMeans.
+        """Asigna el cluster de comportamiento del usuario vía KMeans.
 
-        Si el usuario no estaba presente en el entrenamiento del KMeans, se le asigna -1
-        (cluster desconocido). De lo contrario, se escalan sus features y se predice
-        a cuál de los 5 clusters pertenece.
+        Usuarios no vistos durante el entrenamiento → cluster = -1.
+        Accede a clusters.scaler_user / kmeans_user / user_profiles como
+        atributos tipados (no como claves de dict) para detectar errores en startup.
         """
         matrix = matrix.copy()
-        # Usuario nuevo/desconocido: no se puede asignar cluster → -1
-        if user_id not in user_profiles_ref.index:
+        if user_id not in clusters.user_profiles.index:
             matrix["user_cluster"] = -1
             return matrix
-
-        # Calcula el perfil promedio del usuario con las features de clustering
         profile = matrix.groupby("user_key")[USER_CLUSTER_FEATURES].mean()
-        scaled = scaler_user.transform(profile)
-        cluster = int(kmeans_user.predict(scaled)[0])
-        matrix["user_cluster"] = cluster
+        scaled  = clusters.scaler_user.transform(profile)
+        matrix["user_cluster"] = int(clusters.kmeans_user.predict(scaled)[0])
         return matrix
 
     @staticmethod
     def _assign_product_clusters(
         matrix: pd.DataFrame,
-        scaler_product,
-        kmeans_product,
-        product_profiles_ref: pd.DataFrame,
+        clusters: _ClusterArtifacts,
     ) -> pd.DataFrame:
-        """Asigna el cluster de popularidad/comportamiento a cada producto usando KMeans.
+        """Asigna el cluster de popularidad a cada producto vía KMeans.
 
-        Solo se asigna cluster a los productos que estaban en el set de entrenamiento
-        del KMeans. Los productos nuevos/desconocidos reciben -1.
+        Productos no vistos durante el entrenamiento → cluster = -1.
         """
-        matrix = matrix.copy()
-
-        # Calcula el perfil promedio de cada producto con sus features de clustering
+        matrix   = matrix.copy()
         profiles = matrix.groupby("product_key")[PRODUCT_CLUSTER_FEATURES].mean()
-        # Por defecto todos los productos arrancan con cluster -1 (desconocido)
-        clusters = pd.Series(-1, index=profiles.index, name="product_cluster", dtype="int8")
+        cluster_series = pd.Series(-1, index=profiles.index, name="product_cluster", dtype="int8")
 
-        # Solo predice para productos que el KMeans conoce
-        known = profiles.index.isin(product_profiles_ref.index)
+        known = profiles.index.isin(clusters.product_profiles.index)
         if known.any():
-            known_profiles = profiles[known].fillna(profiles[known].median())  # Imputa NaNs con la mediana
-            known_scaled = scaler_product.transform(known_profiles)
-            clusters.loc[known_profiles.index] = kmeans_product.predict(known_scaled).astype("int8")
+            kp     = profiles[known].fillna(profiles[known].median())
+            scaled = clusters.scaler_product.transform(kp)
+            cluster_series.loc[kp.index] = clusters.kmeans_product.predict(scaled).astype("int8")
 
-        return matrix.merge(clusters.reset_index(), on="product_key", how="left")
+        return matrix.merge(cluster_series.reset_index(), on="product_key", how="left")
+
+    # ------------------------------------------------------------------
+    # Pipeline de features online
+    # ------------------------------------------------------------------
 
     def _build_online_matrix(self, user_id: int) -> pd.DataFrame:
-        """Construye la matriz de features online para un usuario, lista para el modelo.
+        """Construye la matriz de features usuario-producto para inferencia en tiempo real.
 
-        Flujo:
-        1. Trae el historial de compras previas del usuario desde la DB
-        2. Calcula features del usuario (frecuencia, recencia, etc.)
-        3. Calcula features de interacción usuario-producto (cuantas veces compró cada uno)
-        4. Trae features estadísticas de los productos desde la DB
-        5. Filtra productos con poco historial global (< 50 compras totales)
-        6. Une todas las features en una sola matriz por par usuario-producto
-        7. Calcula features derivadas (up_reorder_rate, up_orders_since_last_purchase)
-        8. Asigna clusters de usuario y producto con KMeans
-
-        Cada fila de la matriz resultante representa un producto candidato
-        a ser recomendado al usuario.
+        Pasos:
+          1. Historial prior desde RDS
+          2. Features del usuario (frecuencia, recencia, segmento)
+          3. Features usuario-producto (cuántas veces compró cada producto)
+          4. Features estadísticas de productos calculadas en RDS (CTEs)
+          5. Filtro: descarta productos con < 50 compras globales
+          6. Join de todas las features en una sola matriz
+          7. Features derivadas (up_reorder_rate, up_orders_since_last_purchase)
+          8. Clusters de usuario y producto usando _ClusterArtifacts
         """
-        # 1. Historial de compras del usuario
         prior = self._query_user_prior(user_id)
         if prior.empty:
-            raise UserNotFoundError(f"user_id {user_id} no existe en fact_order_products para get_eval='prior'.")
+            raise UserNotFoundError(
+                f"user_id {user_id} sin historial prior en fact_order_products."
+            )
 
-        # Aseguramos tipos numéricos correctos (la DB puede devolver strings en algunos drivers)
-        for col in ["user_key", "product_key", "order_key", "order_number", "reordered", "add_to_cart_order"]:
+        for col in ["user_key", "product_key", "order_key", "order_number",
+                    "reordered", "add_to_cart_order"]:
             if col in prior.columns:
                 prior[col] = pd.to_numeric(prior[col], errors="coerce")
 
-        # 2. Lista única de productos que compró el usuario
-        product_keys = sorted(prior["product_key"].dropna().astype(int).unique().tolist())
+        product_keys     = sorted(prior["product_key"].dropna().astype(int).unique().tolist())
         dim_product_user = self._query_user_dim_product(product_keys)
-        dim_product_norm = _normalize_dim_product(dim_product_user)  # Normaliza nombres de dept/pasillo
+        dim_product_norm = _normalize_dim_product(dim_product_user)
 
-        # 3. Calcula todas las features por separado
-        user_feat = get_user_features(prior, min_user_orders=1)           # Features del usuario
-        up_feat = get_user_product_features(prior)                         # Features usuario-producto
-        user_dept = get_user_department_feature(prior, dim_product_norm)   # Preferencia por departamento
-        user_aisle = get_user_aisle_feature(prior, dim_product_norm)       # Preferencia por pasillo
+        user_feat   = get_user_features(prior, min_user_orders=1)
+        up_feat     = get_user_product_features(prior)
+        user_dept   = get_user_department_feature(prior, dim_product_norm)
+        user_aisle  = get_user_aisle_feature(prior, dim_product_norm)
 
-        # 4. Features globales de los productos (calculadas en la DB con toda la historia)
         product_feat = self._query_product_features(product_keys)
-        # 5. Filtra productos con muy poco historial global (no son confiables para el modelo)
         product_feat = product_feat.dropna(subset=["product_total_purchases"]).copy()
         product_feat = product_feat[product_feat["product_total_purchases"] >= 50].copy()
         if product_feat.empty:
             raise UserNotFoundError(
-                f"user_id {user_id} no tiene productos con historial suficiente para inferencia."
+                f"user_id {user_id} sin productos con historial suficiente (≥ 50 compras globales)."
             )
 
-        # Filtra la matriz de interacciones para quedarse solo con productos válidos
         valid_products = set(product_feat["product_key"].astype(int).tolist())
         matrix = up_feat[up_feat["product_key"].isin(valid_products)].copy()
         if matrix.empty:
             raise UserNotFoundError(
-                f"user_id {user_id} no tiene pares usuario-producto válidos tras filtros de inferencia."
+                f"user_id {user_id} sin pares usuario-producto válidos tras filtros."
             )
 
-        # 6. Une todas las features en una sola matriz
-        matrix = matrix.merge(user_feat, on="user_key", how="left")
+        matrix = matrix.merge(user_feat,    on="user_key",    how="left")
         matrix = matrix.merge(product_feat, on="product_key", how="left")
-        matrix = matrix.merge(user_dept, on="user_key", how="left")
-        matrix = matrix.merge(user_aisle, on="user_key", how="left")
+        matrix = matrix.merge(user_dept,    on="user_key",    how="left")
+        matrix = matrix.merge(user_aisle,   on="user_key",    how="left")
 
-        # 7. Features derivadas: tasa de recompra del par usuario-producto
         matrix["up_reorder_rate"] = (
             matrix["up_times_purchased"] / matrix["user_total_orders"]
         ).astype("float32")
-        # Cuántas órdenes pasaron desde la última vez que compró este producto
         matrix["up_orders_since_last_purchase"] = (
             matrix["user_total_orders"] - matrix["up_last_order_number"]
         ).clip(lower=0).astype("int16")
 
-        # 8. Asigna cluster de usuario y de producto con los modelos KMeans entrenados
-        cluster_models = self._artifacts.cluster_models
-        matrix = self._assign_user_cluster(
-            matrix=matrix,
-            user_id=user_id,
-            scaler_user=cluster_models["scaler_user"],
-            kmeans_user=cluster_models["kmeans_user"],
-            user_profiles_ref=cluster_models["user_profiles"],
-        )
-        matrix = self._assign_product_clusters(
-            matrix=matrix,
-            scaler_product=cluster_models["scaler_product"],
-            kmeans_product=cluster_models["kmeans_product"],
-            product_profiles_ref=cluster_models["product_profiles"],
-        )
+        # Usa el objeto _ClusterArtifacts tipado en lugar del dict raw
+        clusters = self._artifacts.clusters
+        matrix = self._assign_user_cluster(matrix, user_id, clusters)
+        matrix = self._assign_product_clusters(matrix, clusters)
 
         return matrix
 
-    def _align_and_validate(self, matrix: pd.DataFrame) -> pd.DataFrame:
-        """Verifica que la matriz tenga exactamente las columnas que espera el modelo.
+    # ------------------------------------------------------------------
+    # Validación del contrato de features
+    # ------------------------------------------------------------------
 
-        El modelo LightGBM fue entrenado con un conjunto fijo de features (feature_cols).
-        Si la matriz online tiene columnas de más, de menos, o en distinto orden, la
-        predicción sería incorrecta. Esta función actúa como contrato de calidad.
-        """
-        # Detecta si falta alguna feature que el modelo entrenado requiere
-        missing = [col for col in self.feature_cols if col not in matrix.columns]
+    def _align_and_validate(self, matrix: pd.DataFrame) -> pd.DataFrame:
+        """Garantiza que la matriz tenga exactamente las columnas del modelo entrenado."""
+        missing = [c for c in self.feature_cols if c not in matrix.columns]
         if missing:
             raise FeatureContractError(f"Columnas faltantes para inferencia: {missing}")
 
-        # Selecciona y ordena las columnas exactamente igual que en el entrenamiento
         X = matrix[self.feature_cols].copy()
         if X.shape[1] != self.n_features:
             raise FeatureContractError(
                 f"n_features inválido: esperado={self.n_features}, recibido={X.shape[1]}"
             )
-
         return X
 
+    # ------------------------------------------------------------------
+    # Punto de entrada público
+    # ------------------------------------------------------------------
+
     def recommend_user(self, user_id: int, top_k: int = 10) -> List[dict]:
-        """Genera las top_k recomendaciones de productos para un usuario.
+        """Genera las top_k recomendaciones de next-basket para un usuario.
 
-        Si el usuario tiene 0 órdenes prior → lanza UserNotFoundError (404).
-        Si el usuario tiene entre 1 y MIN_ORDERS_FOR_MODEL-1 órdenes (cold-start) →
-            devuelve el ranking de sus productos más comprados (sin usar el modelo ML).
-        Si el usuario tiene >= MIN_ORDERS_FOR_MODEL órdenes → flujo completo de inferencia:
-            1. Construye la matriz de features online
-            2. Alinea y valida las features contra el contrato del modelo
-            3. Predice la probabilidad de recompra con LightGBM
-            4. Ordena por probabilidad descendente y toma los top_k
-            5. Enriquece con el nombre del producto y devuelve como lista de dicts
+        Lógica de decisión:
+          n_orders == 0            → UserNotFoundError (HTTP 404)
+          0 < n_orders < MIN_ORDERS → cold-start (ranking por frecuencia personal)
+          n_orders >= MIN_ORDERS   → inferencia completa con LightGBM
 
-        Retorna una lista de dicts con product_key, product_name y probability.
+        Retorna lista de dicts: [{product_key, product_name, probability}, ...]
         """
-        # Verifica si el usuario tiene historia y si hay suficiente para el modelo completo
         n_orders = self._query_user_order_count(user_id)
         if n_orders == 0:
             raise UserNotFoundError(
-                f"user_id {user_id} no existe en fact_order_products para get_eval='prior'."
+                f"user_id {user_id} sin historial prior en fact_order_products."
             )
         if n_orders < MIN_ORDERS_FOR_MODEL:
-            # Cold-start: devuelve los productos más comprados en lugar de usar el modelo
+            logger.info("cold-start | user_id=%d | n_orders=%d", user_id, n_orders)
             return self._cold_start_top_products(user_id, top_k)
 
-        # 1. Construye la matriz de features (una fila por producto candidato)
         matrix = self._build_online_matrix(user_id)
-        # 2. Valida y selecciona solo las columnas que el modelo espera
-        X = self._align_and_validate(matrix)
+        X      = self._align_and_validate(matrix)
 
-        # 3. Predice: predict_proba devuelve [prob_clase_0, prob_clase_1]
-        #    Tomamos [:, 1] = probabilidad de que el usuario recompre ese producto
         import typing
-        model = typing.cast(typing.Any, self._artifacts.model)
+        model         = typing.cast(typing.Any, self._artifacts.model)
         probabilities = model.predict_proba(X)[:, 1]
+
         scored = matrix[["product_key"]].copy()
         scored["probability"] = probabilities
-        # 4. Ordena de mayor a menor probabilidad y se queda con los top_k
         scored = scored.sort_values("probability", ascending=False).head(top_k)
 
-        # 5. Agrega el nombre del producto (consulta adicional a la DB)
-        product_names = (
+        names = (
             self._query_user_dim_product(scored["product_key"].astype(int).tolist())
-            .loc[:, ["product_key", "product_name"]]
+            [["product_key", "product_name"]]
             .drop_duplicates(subset=["product_key"])
         )
-        scored = scored.merge(product_names, on="product_key", how="left")
+        scored = scored.merge(names, on="product_key", how="left")
 
-        # Serializa a lista de dicts (compatible con JSON para la respuesta HTTP)
         return [
             {
-                "product_key": int(row.product_key),
+                "product_key":  int(row.product_key),
                 "product_name": None if pd.isna(row.product_name) else str(row.product_name),
-                "probability": float(row.probability),
+                "probability":  float(row.probability),
             }
             for row in scored.itertuples(index=False)
         ]
