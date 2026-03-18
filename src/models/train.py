@@ -511,7 +511,8 @@ def train(
             try:
                 _s3 = boto3.client("s3")
                 _buf = io.BytesIO()
-                _s3.download_fileobj(S3_BUCKET, "models/latest/model_log.json", _buf)
+                _s3.download_fileobj(S3_BUCKET, "models/latest/model_log.json", _buf,
+                                     ExtraArgs={"ExpectedBucketOwner": os.getenv("AWS_ACCOUNT_ID", "")})
                 _buf.seek(0)
                 old_log = json.loads(_buf.read().decode("utf-8"))
             except Exception as _e:
@@ -595,9 +596,10 @@ def train(
             versioned_cluster = f"models/{run_id}/cluster_models.pkl"
             versioned_log     = f"models/{run_id}/model_log.json"
 
-            _s3.upload_file(str(model_path),   S3_BUCKET, versioned_model)
-            _s3.upload_file(str(cluster_path), S3_BUCKET, versioned_cluster)
-            _s3.upload_file(str(log_path),     S3_BUCKET, versioned_log)
+            _owner = {"ExpectedBucketOwner": os.getenv("AWS_ACCOUNT_ID", "")}
+            _s3.upload_file(str(model_path),   S3_BUCKET, versioned_model,   ExtraArgs=_owner)
+            _s3.upload_file(str(cluster_path), S3_BUCKET, versioned_cluster, ExtraArgs=_owner)
+            _s3.upload_file(str(log_path),     S3_BUCKET, versioned_log,     ExtraArgs=_owner)
             logger.info(
                 f"Artefactos versionados subidos a s3://{S3_BUCKET}/{versioned_model} (y cluster + log)"
             )

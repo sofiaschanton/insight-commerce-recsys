@@ -161,7 +161,8 @@ class RecommendationService:
             s3_key = self._s3_key(filename)
             try:
                 logger.info("S3 download | bucket=%s | key=%s → %s", S3_BUCKET, s3_key, local_path)
-                s3.download_file(S3_BUCKET, s3_key, local_path)
+                s3.download_file(S3_BUCKET, s3_key, local_path,
+                                 ExtraArgs={"ExpectedBucketOwner": os.getenv("AWS_ACCOUNT_ID", "")})
                 logger.info("S3 download OK | %s", local_path)
             except ClientError as err:
                 error_code = err.response.get("Error", {}).get("Code", "UNKNOWN")

@@ -238,6 +238,7 @@ def run_snapshot(
             Bucket=S3_BUCKET,
             Key=s3_key,
             Body=_buf.read(),
+            ExpectedBucketOwner=os.getenv("AWS_ACCOUNT_ID", ""),
         )
         logger.info(f"Snapshot subido a s3://{S3_BUCKET}/{s3_key} ({len(matrix):,} filas)")
     else:
