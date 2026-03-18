@@ -45,7 +45,7 @@ PRODUCT_CLUSTER_FEATURES = [
 
 logger = logging.getLogger("api")
 
-S3_BUCKET: str = os.environ["S3_BUCKET"]
+S3_BUCKET: str = os.getenv("S3_BUCKET", "")
 S3_PREFIX: str = os.getenv("S3_PREFIX", "models")
 
 _TMP             = "/tmp"
@@ -115,6 +115,12 @@ class RecommendationService:
         self._artifacts: LoadedArtifacts | None = None
 
     def startup(self) -> None:
+        use_s3 = os.getenv("USE_S3", "false").lower() == "true"
+        if use_s3 and not S3_BUCKET:
+            raise RuntimeError(
+                "S3_BUCKET no está configurado y USE_S3=true. "
+                "Definir S3_BUCKET en la ECS Task Definition antes de desplegar."
+            )
         self._artifacts   = self._download_and_load_artifacts()
         self.engine       = self._build_engine()
         self.model_name   = str(self._artifacts.model_log.get("model_name",   self.model_name))
