@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import sys
+from datetime import datetime, timezone
 
 import boto3
 import numpy as np
@@ -43,6 +44,13 @@ REFERENCE_PATH = os.getenv(
 
 S3_BUCKET = os.getenv("S3_BUCKET", "insight-commerce-artifacts")
 USE_S3 = os.getenv("USE_S3", "false").lower() == "true"
+
+# Claves S3 para las distribuciones de referencia y actual.
+# Configurable por variable de entorno para soportar distintos entornos.
+# - S3_CURRENT_KEY : snapshot semanal generado por el job build-snapshot
+# - S3_REFERENCE_KEY: baseline fijo guardado tras el último reentrenamiento
+S3_CURRENT_KEY = os.getenv("S3_CURRENT_KEY", "monitoring/actual/feature_matrix.parquet")
+S3_REFERENCE_KEY = os.getenv("S3_REFERENCE_KEY", "feature_matrix_reference.parquet")
 
 # Features numéricas a monitorear — se excluyen NaN intencionales y columnas categóricas
 MONITORED_FEATURES = [
@@ -109,7 +117,7 @@ def _load_data(
     """
     Carga los DataFrames de referencia y actual.
 
-    Si USE_S3=true, descarga desde S3 usando el nombre de archivo como key.
+    Si USE_S3=true, descarga desde S3 usando S3_CURRENT_KEY y S3_REFERENCE_KEY.
     Si USE_S3=false (default), lee desde disco local.
 
     Returns
@@ -118,8 +126,10 @@ def _load_data(
     """
     if USE_S3:
         s3 = boto3.client("s3")
-        current_key = os.path.basename(current_path)
-        ref_key = os.path.basename(reference_path)
+        # Usa las claves S3 configuradas por variable de entorno, no el basename del path local.
+        # Esto permite rutas anidadas como "monitoring/actual/feature_matrix.parquet".
+        current_key = S3_CURRENT_KEY
+        ref_key = S3_REFERENCE_KEY
 
         try:
             buf = io.BytesIO()
@@ -156,7 +166,7 @@ def _load_data(
     if not os.path.exists(current_path):
         logging.error(
             f"No se encontró feature_matrix en '{current_path}'. "
-            "Asegurarse de que el pipeline de features haya corrido y generado el archivo antes de ejecutar el monitoreo."
+            "Asegurarse de que el pipeline de features haya corrido antes de ejecutar el monitoreo."
         )
         sys.exit(1)
 
@@ -193,7 +203,7 @@ def compute_drift_metrics(
 
     Returns
     -------
-    dict con psi, ks, drift_detected y breakdowns por feature.
+    dict con timestamp, triggered_by, retrain_run_id, psi, ks, drift_detected y breakdowns por feature.
     """
     logging.info("Iniciando escaneo de Data Drift (Métricas PSI y KS)...")
 
@@ -248,6 +258,9 @@ def compute_drift_metrics(
     drift_detected = bool(psi > 0.25 or ks > 0.3)
 
     result = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "triggered_by": os.getenv("DRIFT_TRIGGERED_BY", "manual"),
+        "retrain_run_id": os.getenv("GITHUB_RUN_ID", ""),
         "psi": psi,
         "ks": ks,
         "drift_detected": drift_detected,

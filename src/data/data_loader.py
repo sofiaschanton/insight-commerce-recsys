@@ -40,20 +40,37 @@ if not logger.handlers:
 # AWS_USER, AWS_PASSWORD, AWS_HOST, AWS_PORT, AWS_DATABASE
 load_dotenv()
 
-def _build_db_url() -> str:
+def _get_engine():
     """
-    Construye la URL de conexión a AWS RDS usando las variables de entorno.
-    Usamos URL.create() en lugar de f-string para manejar correctamente
-    caracteres especiales en la contraseña (ej: @, #, %).
+    Crea el engine de SQLAlchemy configurando correctamente SSL 
+    para la conexión con AWS RDS.
     """
-    return str(URL.create(
+    # 1. Construir la URL base
+    db_url = URL.create(
         drivername = 'postgresql+psycopg2',
         username   = os.getenv('AWS_USER'),
         password   = os.getenv('AWS_PASSWORD'),
         host       = os.getenv('AWS_HOST'),
         port       = int(os.getenv('AWS_PORT', '5432')),
         database   = os.getenv('AWS_DATABASE'),
-    ))
+    )
+
+    # 2. Configurar argumentos de conexión (SSL)
+    # Leemos el modo desde el .env (por defecto verify-full si queremos usar el certificado)
+    ssl_mode = os.getenv("AWS_SSLMODE", "verify-full")
+    
+    connect_args = {}
+    
+    if ssl_mode in ["verify-full", "verify-ca"]:
+        connect_args["sslmode"] = ssl_mode
+        # Importante: El archivo debe estar en la raíz del proyecto
+        connect_args["sslrootcert"] = "./global-bundle.pem"
+        logger.info(f"Configurando conexión segura SSL (mode: {ssl_mode})")
+    else:
+        connect_args["sslmode"] = ssl_mode # Ej: 'require'
+
+    # 3. Crear el engine con los argumentos de SSL
+    return create_engine(db_url, connect_args=connect_args)
 
 # ─── Configuración de tablas ──────────────────────────────────────────────────
 # Tablas disponibles en el schema dimensional de AWS RDS
@@ -178,7 +195,8 @@ def load_data_from_aws(
 
     # ── Conexión ───────────────────────────────────────────────────────────
     # Si se pasan credenciales externas se construye la URL manualmente,
-    # sino se usa _build_db_url() que lee del .env
+    # sino se usa _get_engine() que lee del .env
+    t0 = time.perf_counter()
     if connection_config:
         db_url = (
             f"postgresql+psycopg2://{connection_config.get('AWS_USER')}"
@@ -188,13 +206,9 @@ def load_data_from_aws(
             f"/{connection_config.get('AWS_DATABASE', 'postgres')}"
         )
         logger.info("Usando connection_config externo")
+        engine = create_engine(db_url)
     else:
-        db_url = _build_db_url()
-
-    t0 = time.perf_counter()
-    # sslmode=require es obligatorio en AWS RDS (conexión encriptada)
-    # pool_pre_ping=True verifica la conexión antes de cada query para evitar conexiones muertas
-    engine = create_engine(db_url, connect_args={"connect_timeout": 10, "sslmode": "require"}, pool_pre_ping=True)
+        engine = _get_engine()
     load_log = []  # registro interno para el resumen final
 
     def _query(sql: str, label: str) -> pd.DataFrame:

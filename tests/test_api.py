@@ -35,7 +35,7 @@ def mock_service():
     svc = MagicMock()
     svc.model_name = "LightGBM optimizado"
     svc.n_features = 26
-    svc.recommend_user.return_value = _SAMPLE_RECS
+    svc.recommend_user.return_value = (_SAMPLE_RECS, False)
     return svc
 
 
@@ -145,7 +145,7 @@ def test_recommend_batch_user_not_found_is_partial_error(client, mock_service):
     def side_effect(user_id, top_k):
         if user_id == 99:
             raise UserNotFoundError("no encontrado")
-        return _SAMPLE_RECS
+        return _SAMPLE_RECS, False
 
     mock_service.recommend_user.side_effect = side_effect
     data = client.post("/recommend/batch", json={"user_ids": [1, 99]}).json()
@@ -192,3 +192,47 @@ def test_recommend_batch_missing_body_returns_422(client):
 def test_recommend_batch_exactly_100_users_returns_200(client):
     resp = client.post("/recommend/batch", json={"user_ids": list(range(1, 101))})
     assert resp.status_code == 200
+
+
+# ── GET /health — error branches ──────────────────────────────────────────────
+
+def test_health_returns_503_when_artifacts_none(client, mock_service):
+    mock_service._artifacts = None
+    resp = client.get("/health")
+    assert resp.status_code == 503
+
+
+def test_health_returns_503_when_engine_none(client, mock_service):
+    mock_service._artifacts = MagicMock()
+    mock_service.engine = None
+    resp = client.get("/health")
+    assert resp.status_code == 503
+
+
+def test_health_returns_503_when_rds_unavailable(client, mock_service):
+    from sqlalchemy.exc import OperationalError
+
+    op_err = OperationalError.__new__(OperationalError)
+    Exception.__init__(op_err, "connection refused")
+
+    mock_conn = MagicMock()
+    mock_conn.execute.side_effect = op_err
+    mock_ctx = MagicMock()
+    mock_ctx.__enter__ = MagicMock(return_value=mock_conn)
+    mock_ctx.__exit__ = MagicMock(return_value=False)
+    mock_service._artifacts = MagicMock()
+    mock_service.engine.connect.return_value = mock_ctx
+
+    resp = client.get("/health")
+    assert resp.status_code == 503
+
+
+# ── Global exception handler ──────────────────────────────────────────────────
+
+def test_global_exception_handler_returns_500(mock_service):
+    """Una excepción no controlada en la ruta debe activar el handler global y devolver 500."""
+    mock_service.recommend_user.side_effect = RuntimeError("unexpected server error")
+    with patch("src.api.main.service", mock_service):
+        with TestClient(app, raise_server_exceptions=False) as c:
+            resp = c.post("/recommend/42")
+    assert resp.status_code == 500

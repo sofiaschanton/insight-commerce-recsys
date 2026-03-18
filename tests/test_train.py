@@ -23,7 +23,7 @@ import numpy as np
 import pandas as pd
 import pytest
 from pathlib import Path
-from unittest.mock import MagicMock, call
+from unittest.mock import MagicMock, call, patch
 
 from src.models.train import (
     USER_CLUSTER_FEATURES,
@@ -352,7 +352,7 @@ def test_train_no_optuna_best_params_has_defaults(tmp_path, train_matrix, mock_m
 def test_train_calls_mlflow_start_run(tmp_path, train_matrix, mock_mlflow, mock_joblib, mock_lgbm):
     train(matrix=train_matrix, models_dir=tmp_path, run_optuna_flag=False)
 
-    mock_mlflow.start_run.assert_called_once_with(run_name="lgbm_kmeans_pipeline")
+    mock_mlflow.start_run.assert_called_once_with(run_name="lgbm_kmeans_pipeline", nested=True)
 
 
 def test_train_logs_mlflow_metrics(tmp_path, train_matrix, mock_mlflow, mock_joblib, mock_lgbm):
@@ -486,3 +486,67 @@ def test_train_with_optuna_study_optimize_called(tmp_path, train_matrix, mock_ml
     study.optimize.assert_called_once()
     call_kwargs = study.optimize.call_args
     assert call_kwargs.kwargs.get("n_trials") == 3 or call_kwargs.args[1] == 3
+
+
+# ── Tests: train() — cargar desde parquet cuando matrix=None ─────────────────
+
+def test_train_loads_from_parquet_when_matrix_is_none(tmp_path, train_matrix, mock_mlflow, mock_joblib, mock_lgbm):
+    """Cuando matrix=None, train() lee la feature matrix desde el parquet indicado."""
+    parquet_path = tmp_path / "feature_matrix.parquet"
+    train_matrix.to_parquet(parquet_path, index=False)
+
+    result = train(
+        parquet_path=parquet_path,
+        models_dir=tmp_path,
+        run_optuna_flag=False,
+        matrix=None,
+    )
+
+    assert "model" in result
+    assert "feature_cols" in result
+
+
+# ── Tests: train() — rollback check desde S3 ─────────────────────────────────
+
+def test_train_s3_rollback_check_reads_from_s3(tmp_path, train_matrix, mock_mlflow, mock_joblib, mock_lgbm, monkeypatch):
+    """Cuando USE_S3=true y no hay model_log.json local, intenta leerlo desde S3."""
+    import io as _io
+    monkeypatch.setattr("src.models.train.USE_S3", True)
+
+    mock_s3 = MagicMock()
+    old_log = {"metrics_test": {"f1": 0.0}}
+    buf_bytes = json.dumps(old_log).encode("utf-8")
+
+    def fake_download_fileobj(bucket, key, buf):
+        buf.write(buf_bytes)
+
+    mock_s3.download_fileobj.side_effect = fake_download_fileobj
+
+    with patch("src.models.train.boto3.client", return_value=mock_s3):
+        result = train(matrix=train_matrix, models_dir=tmp_path, run_optuna_flag=False)
+
+    mock_s3.download_fileobj.assert_called_once()
+    assert "model" in result
+
+
+# ── Tests: train() — subida a S3 cuando USE_S3=true y F1 pasa el gate ────────
+
+def test_train_uploads_to_s3_when_use_s3_true(tmp_path, train_matrix, mock_mlflow, mock_joblib, mock_lgbm, monkeypatch):
+    """Cuando USE_S3=true y F1 >= F1_THRESHOLD, sube 3 artefactos y actualiza 'latest'."""
+    monkeypatch.setattr("src.models.train.USE_S3", True)
+    monkeypatch.setattr("src.models.train.F1_THRESHOLD", -1.0)  # siempre pasa el gate
+
+    mock_s3 = MagicMock()
+    # rollback check: S3 falla → continúa sin rollback
+    mock_s3.download_fileobj.side_effect = Exception("no log in S3")
+
+    mock_run = MagicMock()
+    mock_run.info.run_id = "test-run-id-123"
+    mock_mlflow.active_run.return_value = mock_run
+
+    with patch("src.models.train.boto3.client", return_value=mock_s3):
+        result = train(matrix=train_matrix, models_dir=tmp_path, run_optuna_flag=False)
+
+    assert mock_s3.upload_file.call_count == 3    # model.pkl, cluster_models.pkl, model_log.json
+    assert mock_s3.copy.call_count == 3            # punteros 'latest'
+    assert "model" in result
