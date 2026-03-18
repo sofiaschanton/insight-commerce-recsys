@@ -289,13 +289,60 @@ jobs:
             --services insight-api-service
           echo "Servicio estable. Deploy completado."
 
-      # Descomentar cuando ALB_DNS esté configurado como secret:
-      # - name: Health check — GET /health
-      #   run: |
-      #     STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
-      #       "http://${{ secrets.ALB_DNS }}/health")
-      #     if [ "$STATUS" != "200" ]; then
-      #       echo "Health check falló con HTTP $STATUS"
-      #       exit 1
-      #     fi
-      #     echo "Health check OK — HTTP $STATUS"
+      - name: Health check post-deploy
+        run: |
+          for i in {1..5}; do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+              "http://${{ secrets.ALB_DNS }}/health")
+            if [ "$STATUS" = "200" ]; then
+              echo "✅ API healthy — HTTP $STATUS"
+              exit 0
+            fi
+            echo "⏳ Intento $i/5 — HTTP $STATUS"
+            sleep 10
+          done
+          echo "❌ Health check falló"
+          exit 1
+
+      - name: Smoke test del modelo en producción
+        run: |
+          pip install requests --quiet
+          python3 -c "
+          import requests
+          r = requests.post(
+              'http://${{ secrets.ALB_DNS }}/recommend',
+              json={'user_id': 1},
+              timeout=10
+          )
+          assert r.status_code == 200, f'HTTP inesperado: {r.status_code}'
+          assert 'recommendations' in r.json(), 'Respuesta inválida'
+          print('✅ Modelo respondiendo correctamente')
+          "
+
+      - name: Rollback ECS si post-deploy falla
+        if: failure()
+        run: |
+          echo "⏪ Iniciando rollback en ECS..."
+          PREV_TASK=$(aws ecs describe-services \
+            --cluster insight-commerce-cluster \
+            --services insight-api-service \
+            --query 'services[0].deployments[-1].taskDefinition' \
+            --output text)
+          aws ecs update-service \
+            --cluster insight-commerce-cluster \
+            --service insight-api-service \
+            --task-definition $PREV_TASK
+          echo "✅ Rollback completado — modelo anterior restaurado"
+
+      - name: Notify deploy failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              title: '[MLOps] Deploy fallido — rollback automático ejecutado',
+              body: `Health check o smoke test fallaron. Rollback ejecutado.\nRun: ${context.runId}`,
+              labels: ['rollback', 'mlops', 'deploy'],
+            });

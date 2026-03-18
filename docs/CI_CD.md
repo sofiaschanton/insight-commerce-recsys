@@ -9,6 +9,7 @@ Pipeline de integración y entrega continua basado en GitHub Actions, dividido e
 | Workflow | Archivo | Trigger | Propósito |
 |----------|---------|---------|-----------|
 | **CI** | `ci.yml` | push / pull_request | Calidad de código: tests, tipos, cobertura |
+| **CD** | `cd.yml` | `ci.yml` exitoso en main / manual | Deploy de código a ECS: rolling update + health check |
 | **MLOps** | `mlops.yml` | cron semanal / manual | Pipeline MLOps: snapshot → drift → retrain → deploy |
 
 ---
@@ -23,6 +24,18 @@ ci.yml — push (main, develop, feature/**, fix/**) / pull_request (main, develo
                ├─ pytest --cov=src → coverage.xml
                ├─ mypy src/
                └─ SonarCloud scan
+                       │
+                       │ ci.yml exitoso en main
+                       ▼
+cd.yml — workflow_run (ci.yml completed) / workflow_dispatch (skip_deploy)
+        │
+        └─── deploy
+               ├─ [skip si skip_deploy=true] aws ecs update-service --force-new-deployment
+               ├─ [skip si skip_deploy=true] aws ecs wait services-stable
+               ├─ health check GET /health → ALB (5 reintentos)
+               ├─ smoke test POST /recommend
+               ├─ rollback automático a task definition anterior si falla
+               └─ GitHub Issue si deploy falla
 
 
 mlops.yml — schedule (domingos 23:00 UTC) / workflow_dispatch
@@ -50,7 +63,10 @@ mlops.yml — schedule (domingos 23:00 UTC) / workflow_dispatch
                                                      └─── deploy (needs: retrain)
                                                             ├─ aws ecs update-service --force-new-deployment
                                                             ├─ aws ecs wait services-stable
-                                                            └─ [health check deshabilitado hasta que ALB esté configurado]
+                                                            ├─ health check GET /health → ALB (5 reintentos)
+                                                            ├─ smoke test POST /recommend
+                                                            ├─ rollback automático si falla
+                                                            └─ GitHub Issue si deploy falla
 ```
 
 ---
@@ -64,6 +80,14 @@ mlops.yml — schedule (domingos 23:00 UTC) / workflow_dispatch
 | `push` a `main`, `develop`, `feature/**`, `fix/**` | `test` |
 | `pull_request` hacia `main`, `develop` | `test` |
 | `workflow_dispatch` | `test` |
+
+### `cd.yml`
+
+| Evento | Jobs activados | Condición |
+|--------|----------------|-----------|
+| `workflow_run` — `ci.yml` completado en `main` | `deploy` | Solo si `ci.yml` terminó con `success` |
+| `workflow_dispatch` con `skip_deploy=false` (default) | `deploy` completo | ECS rolling update + health check |
+| `workflow_dispatch` con `skip_deploy=true` | Solo health check + smoke test | ECS no se toca — útil para verificar prod sin deployar |
 
 ### `mlops.yml`
 
@@ -89,6 +113,29 @@ mlops.yml — schedule (domingos 23:00 UTC) / workflow_dispatch
 | Run tests | `pytest --cov=src --cov-report=xml:coverage.xml` |
 | Type check | `mypy src/ --ignore-missing-imports --no-strict-optional` |
 | SonarCloud Scan | Análisis estático + cobertura. Consume `coverage.xml`. |
+
+---
+
+## Jobs — `cd.yml`
+
+### `deploy` — Deploy de código a ECS
+
+**Runner:** `ubuntu-latest`
+**Trigger:** `ci.yml` exitoso en `main`, o `workflow_dispatch`
+
+Deploya cambios de código a ECS sin reentrenar el modelo. El modelo en S3 no se toca — solo se reinicia el contenedor para que levante con el código nuevo.
+
+| Paso | Descripción |
+|------|-------------|
+| Configure AWS credentials | IAM via `aws-actions/configure-aws-credentials@v4` |
+| Force new ECS deployment | `aws ecs update-service --force-new-deployment` — omitido si `skip_deploy=true` |
+| Wait for stability | `aws ecs wait services-stable` — omitido si `skip_deploy=true` |
+| Health check post-deploy | `GET /health` contra ALB (5 reintentos, 10s entre intentos) |
+| Smoke test del modelo | `POST /recommend` con `user_id: 1` — valida que el modelo responde |
+| Rollback automático | Si falla: restaura task definition anterior via `aws ecs update-service --task-definition` |
+| Notify deploy failure | GitHub Issue con labels `rollback`, `cd`, `deploy` |
+
+> **`skip_deploy=true`:** permite correr solo el health check y smoke test sin tocar ECS. Útil para el primer merge a main cuando el código ya está en producción.
 
 ---
 
@@ -221,7 +268,10 @@ Fuerza un nuevo deployment en ECS Fargate sin reconstruir la imagen Docker. Los 
 | Configure AWS credentials | IAM via `aws-actions/configure-aws-credentials@v4` |
 | Force new ECS deployment | `aws ecs update-service --force-new-deployment` |
 | Wait for stability | `aws ecs wait services-stable` — bloquea hasta que el servicio esté estable |
-| Deployment summary | Escribe cluster, servicio y run ID al Step Summary |
+| Health check post-deploy | `GET /health` contra ALB (5 reintentos, 10s entre intentos) |
+| Smoke test del modelo | `POST /recommend` con `user_id: 1` — valida que el modelo responde correctamente |
+| Rollback automático | Si health check o smoke test fallan: restaura task definition anterior |
+| Notify deploy failure | GitHub Issue con label `rollback`, `mlops`, `deploy` si el deploy falla |
 
 **Infraestructura ECS:**
 
@@ -248,8 +298,6 @@ ECS inicia task nuevo
 ```
 
 El task role `ecsTaskRole-InsightCommerce` tiene política `AmazonS3ReadOnlyAccess`. No se requieren credenciales adicionales para la lectura desde S3.
-
-> **Health check deshabilitado:** el ALB no está configurado todavía. El step está comentado en `mlops.yml` y se activa agregando el secret `ALB_DNS` y descomentando el step correspondiente.
 
 ---
 
@@ -308,21 +356,30 @@ Configurar en **Settings → Secrets and variables → Actions → New repositor
 | `SONAR_TOKEN` | Token de SonarCloud | Configurado |
 | `GITHUB_TOKEN` | Token automático de GitHub | Automático |
 
+### `cd.yml`
+
+| Secret | Descripción | Estado |
+|--------|-------------|--------|
+| `AWS_ACCESS_KEY_ID` | Credencial IAM (ECS) | Configurado |
+| `AWS_SECRET_ACCESS_KEY` | Credencial IAM | Configurado |
+| `AWS_REGION` | Región AWS (`us-east-2`) | Configurado |
+| `ALB_DNS` | DNS del ALB para health check y smoke test | Configurado |
+
 ### `mlops.yml`
 
 | Secret | Descripción | Estado |
 |--------|-------------|--------|
-| `AWS_ACCESS_KEY_ID` | Credencial IAM (S3 + ECS) | Pendiente |
-| `AWS_SECRET_ACCESS_KEY` | Credencial IAM | Pendiente |
-| `AWS_REGION` | Región AWS (`us-east-2`) | Pendiente |
-| `AWS_HOST` | Host RDS PostgreSQL | Pendiente |
-| `AWS_DATABASE` | Nombre de la base de datos | Pendiente |
-| `AWS_USER` | Usuario RDS | Pendiente |
-| `AWS_PASSWORD` | Contraseña RDS | Pendiente |
-| `AWS_PORT` | Puerto RDS (`5432`) | Pendiente |
-| `AWS_SSLMODE` | Modo SSL (`require`) | Pendiente |
-| `MLFLOW_TRACKING_URI` | URI del servidor MLflow (vacío = archivo local) | Pendiente |
-| `ALB_DNS` | DNS del ALB para health check | Pendiente (ALB no configurado aún) |
+| `AWS_ACCESS_KEY_ID` | Credencial IAM (S3 + ECS) | Configurado |
+| `AWS_SECRET_ACCESS_KEY` | Credencial IAM | Configurado |
+| `AWS_REGION` | Región AWS (`us-east-2`) | Configurado |
+| `AWS_HOST` | Host RDS PostgreSQL | Configurado |
+| `AWS_DATABASE` | Nombre de la base de datos | Configurado |
+| `AWS_USER` | Usuario RDS | Configurado |
+| `AWS_PASSWORD` | Contraseña RDS | Configurado |
+| `AWS_PORT` | Puerto RDS (`5432`) | Configurado |
+| `AWS_SSLMODE` | Modo SSL (`require`) | Configurado |
+| `MLFLOW_TRACKING_URI` | URI del servidor MLflow (vacío = archivo local) | Configurado |
+| `ALB_DNS` | DNS del ALB para health check post-retrain | Configurado |
 
 **Permisos IAM mínimos requeridos para el usuario/rol:**
 
@@ -359,7 +416,9 @@ Configurar en **Settings → Secrets and variables → Actions → New repositor
 |-------|-------|------------|-------------|
 | `data-drift` | `#e4e669` | `drift-check` | Drift estadístico detectado en chequeo semanal |
 | `mlops` | `#0075ca` | `retrain` | Eventos del pipeline MLOps (primer entrenamiento) |
-| `rollback` | `#d93f0b` | `retrain` | Rollback de modelo activado |
+| `rollback` | `#d93f0b` | `retrain`, `deploy` (cd + mlops) | Rollback de modelo o deploy activado |
+| `cd` | `#1d76db` | `deploy` (cd.yml) | Eventos del pipeline de entrega continua |
+| `deploy` | `#e99695` | `deploy` (cd.yml + mlops.yml) | Deploy fallido a ECS |
 
 Los labels se crean automáticamente si no existen (via `gh label create ... 2>/dev/null || true`).
 
@@ -415,7 +474,7 @@ USE_S3=true python -m src.pipeline --trials 50
 
 ## Extensiones futuras
 
-- **Blue/Green deploy:** cuando el ALB esté configurado, migrar a blue/green con AWS CodeDeploy para rollback instantáneo sin downtime (ver tabla comparativa)
-- **Integration tests de API:** job post-deploy que valide `/health` y `/recommend/{user_id}` contra el entorno real antes de considerar el deployment estable
+- **Blue/Green deploy:** cuando se requiera zero-downtime estricto, migrar a blue/green con AWS CodeDeploy — ver tabla comparativa en sección CD
+- **Integration tests de API:** job post-deploy que valide endpoints adicionales más allá de `/health` y `/recommend`
 - **ECR lifecycle policy:** limpiar imágenes viejas automáticamente en ECR para controlar costos de almacenamiento
-- **ALB + health check:** habilitar el step comentado en `mlops.yml` agregando `ALB_DNS` a los secrets de GitHub
+- **Notificaciones Slack:** enviar alertas de drift, rollback y deploy fallido a un canal de equipo
