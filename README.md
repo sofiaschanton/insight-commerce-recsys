@@ -124,6 +124,33 @@ Ofrecemos transparencia total para cada área de la empresa:
 * **`02_Impacto_de_Negocio.py`**: Dashboard de KPIs para el Product Owner.
 * **`03_Metricas_del_Modelo.py`**: Diagnóstico técnico para el equipo de Data Science.
 
+## Dashboards de Visualización (Streamlit)
+
+Ofrecemos transparencia total para cada área de la empresa:
+
+* **`01_Top_10.py`**: Interfaz de cara al cliente final.
+* **`02_Impacto_de_Negocio.py`**: Dashboard de KPIs para el Product Owner.
+* **`03_Metricas_del_Modelo.py`**: Diagnóstico técnico para el equipo de Data Science.
+
+### Cómo levantar la app
+
+**Requisitos previos:**
+- Archivo `.env` configurado con `API_URL` apuntando a la API activa
+- `models/model_log.json` presente en la carpeta `models/`
+
+**Verificar que la API está activa:**
+```
+http://18.217.26.71:8000/docs
+```
+
+**Levantar Streamlit:**
+```bash
+streamlit run app/streamlit_app.py
+```
+
+Las páginas de **Impacto de Negocio** y **Métricas del Modelo** funcionan sin conexión a la API — solo requieren `model_log.json`.
+
+
 ## Instalación
 
 ### 1. Clonar el repositorio
