@@ -2,11 +2,12 @@
 inference.py — Insight Commerce · Recsys API
 Entorno destino: AWS Fargate (ECS) + S3 + RDS PostgreSQL
 Autenticación  : IAM Task Role (ecsTaskRole.InsightCommerce) — sin hardcoded keys
-Artefactos     : descargados desde S3 a /tmp/ al iniciar el contenedor
+Artefactos     : descargados desde S3 a un directorio temporal seguro (tempfile.mkdtemp) al iniciar el contenedor
 """
 import json
 import logging
 import os
+import tempfile
 from dataclasses import dataclass
 from typing import Any, Dict, List
 import boto3
@@ -48,7 +49,7 @@ logger = logging.getLogger("api")
 S3_BUCKET: str = os.getenv("S3_BUCKET", "")
 S3_PREFIX: str = os.getenv("S3_PREFIX", "models")
 
-_TMP             = "/tmp"
+_TMP             = tempfile.mkdtemp(prefix="insight-api-")
 _MODEL_LOCAL     = f"{_TMP}/model.pkl"
 _CLUSTER_LOCAL   = f"{_TMP}/cluster_models.pkl"
 _MODEL_LOG_LOCAL = f"{_TMP}/model_log.json"
