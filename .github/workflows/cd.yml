@@ -100,8 +100,7 @@ jobs:
           python3 -c "
           import requests
           r = requests.post(
-              'http://${{ secrets.ALB_DNS }}/recommend',
-              json={'user_id': 13},
+              'http://${{ secrets.ALB_DNS }}/recommend/13',
               timeout=10
           )
           assert r.status_code == 200, f'HTTP inesperado: {r.status_code}'
