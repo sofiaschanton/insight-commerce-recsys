@@ -1,6 +1,6 @@
 # =============================================================================
 # Dockerfile — Insight Commerce · Recsys API
-# Base  : python:3.11-slim (imagen mínima oficial; sin Debian completo)
+# Base  : python:3.10-slim (imagen mínima oficial; sin Debian completo)
 # Target: AWS Fargate (linux/amd64 — especificar --platform en builds ARM)
 #
 # Cambios en esta versión (production-ready):

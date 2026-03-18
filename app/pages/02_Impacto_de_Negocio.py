@@ -7,20 +7,18 @@ import streamlit as st
 ROOT_DIR = Path(__file__).resolve().parents[2]
 MODEL_LOG_PATH = Path(os.getenv("MODEL_LOG_PATH", ROOT_DIR / "models" / "model_log.json"))
 
-# Paleta Insight Commerce
-COLOR_PRIMARY   = "#FE495F"   # rojo coral
-COLOR_SECONDARY = "#FE9D97"   # rosa salmón
-COLOR_ACCENT    = "#BDED7E"   # verde lima
-COLOR_LIGHT     = "#FFFEC8"   # amarillo crema
-COLOR_BG_CARD   = "#1A1F2C"   # fondo card (secundario)
+COLOR_PRIMARY   = "#FE495F"
+COLOR_SECONDARY = "#FE9D97"
+COLOR_ACCENT    = "#BDED7E"
+COLOR_LIGHT     = "#FFFEC8"
+COLOR_BG_CARD   = "#1A1F2C"
 
 st.set_page_config(
-    page_title="Dashboard · Insight Commerce",
-    page_icon="📊",
+    page_title="Impacto de Negocio · Insight Commerce",
+    page_icon="📈",
     layout="wide",
 )
 
-# ── CSS ───────────────────────────────────────────────────────────────────────
 st.markdown(f"""
 <style>
     .kpi-card {{
@@ -49,12 +47,8 @@ st.markdown(f"""
         color: #888;
         margin-top: 0.2rem;
     }}
-    .kpi-accent {{
-        border-left-color: {COLOR_ACCENT};
-    }}
-    .kpi-yellow {{
-        border-left-color: {COLOR_LIGHT};
-    }}
+    .kpi-accent {{ border-left-color: {COLOR_ACCENT}; }}
+    .kpi-yellow {{ border-left-color: {COLOR_LIGHT}; }}
     .section-title {{
         font-size: 1rem;
         font-weight: 700;
@@ -81,7 +75,6 @@ st.markdown(f"""
 </style>
 """, unsafe_allow_html=True)
 
-# ── Carga de datos ────────────────────────────────────────────────────────────
 @st.cache_data
 def load_model_log() -> dict:
     with open(MODEL_LOG_PATH, "r", encoding="utf-8") as f:
@@ -90,51 +83,47 @@ def load_model_log() -> dict:
 try:
     log = load_model_log()
 except FileNotFoundError:
-    st.error(
-        f"No se encontró model_log.json en {MODEL_LOG_PATH}. "
-        "Verificá que los artefactos del modelo estén en la carpeta models/."
-    )
+    st.error(f"No se encontró model_log.json en {MODEL_LOG_PATH}.")
     st.stop()
 
-metrics   = log.get("metrics_test", {})
-split     = log.get("split", {})
-top10     = log.get("importance_top10", [])
-zero_feat = log.get("features_zero_importance", [])
+metrics    = log.get("metrics_test", {})
+split      = log.get("split", {})
+top10      = log.get("importance_top10", [])
+zero_feat  = log.get("features_zero_importance", [])
 n_features = log.get("n_features", 0)
-model_ts  = log.get("timestamp", "—")[:10]
+model_ts   = log.get("timestamp", "—")[:10]
+uplift     = log.get("uplift", {})
+uplift_pct = uplift.get("uplift_relative_pct", 0)
+uplift_abs = uplift.get("uplift_absolute", 0)
 
-# Métricas clave
 precision = metrics.get("precision", 0)
 recall    = metrics.get("recall", 0)
-f1        = metrics.get("f1", 0)
 auc       = metrics.get("auc", 0)
 
-# Derivados de negocio
-auc_lift_pct   = round((auc - 0.5) / 0.5 * 100)   # % mejor que azar
-precision_pct  = round(precision * 100, 1)
-n_test_users   = split.get("n_test_users", 0)
-n_train_users  = split.get("n_train_users", 0)
-n_val_users    = split.get("n_val_users", 0)
-total_users    = n_train_users + n_val_users + n_test_users
+precision_pct = round(precision * 100, 1)
+
+# El model_log.json nuevo usa claves "train", "val", "test"
+n_train_users = split.get("train", split.get("n_train_users", 0))
+n_val_users   = split.get("val",   split.get("n_val_users",   0))
+n_test_users  = split.get("test",  split.get("n_test_users",  0))
+total_users   = n_train_users + n_val_users + n_test_users
 active_features = n_features - len(zero_feat)
 
-# Nombres legibles de features para el PO
 FEATURE_LABELS = {
-    "up_reorder_rate":           "Tasa de recompra del producto por el usuario",
-    "up_days_since_last":        "Días desde la última compra del producto",
-    "product_reorder_rate":      "Popularidad global del producto",
-    "user_reorder_ratio":        "Frecuencia de recompra del usuario",
-    "up_delta_days":             "Variación en el intervalo de compra",
-    "p_aisle_reorder_rate":      "Popularidad del pasillo del producto",
-    "up_first_order_number":     "Antigüedad del producto en el historial",
-    "u_favorite_aisle":          "Pasillo favorito del usuario",
+    "up_reorder_rate":            "Tasa de recompra del producto por el usuario",
+    "up_days_since_last":         "Días desde la última compra del producto",
+    "product_reorder_rate":       "Popularidad global del producto",
+    "user_reorder_ratio":         "Frecuencia de recompra del usuario",
+    "up_delta_days":              "Variación en el intervalo de compra",
+    "p_aisle_reorder_rate":       "Popularidad del pasillo del producto",
+    "up_first_order_number":      "Antigüedad del producto en el historial",
+    "u_favorite_aisle":           "Pasillo favorito del usuario",
     "user_days_since_last_order": "Días desde la última visita del usuario",
-    "up_times_purchased":        "Cantidad de veces que el usuario compró el producto",
+    "up_times_purchased":         "Cantidad de veces que el usuario compró el producto",
 }
 
-# ── Título ────────────────────────────────────────────────────────────────────
 st.markdown(f"""
-<h1 style='color:{COLOR_PRIMARY}; margin-bottom:0;'>📊 Dashboard de Impacto</h1>
+<h1 style='color:{COLOR_PRIMARY}; margin-bottom:0;'>📈 Impacto de Negocio</h1>
 <p style='color:#888; margin-top:0.2rem;'>
     Insight Commerce · Modelo entrenado el {model_ts}
     <span class="coverage-badge">100% cobertura de usuarios</span>
@@ -163,6 +152,7 @@ with col2:
         <div class="kpi-label">Poder de discriminación</div>
         <div class="kpi-value">{round(auc * 100, 1)}%</div>
         <div class="kpi-sub">AUC-ROC · El modelo acierta en 8 de cada 10 comparaciones entre productos</div>
+    </div>
     """, unsafe_allow_html=True)
 
 with col3:
@@ -179,7 +169,32 @@ with col4:
     <div class="kpi-card kpi-yellow">
         <div class="kpi-label">Usuarios evaluados</div>
         <div class="kpi-value">{n_test_users:,}</div>
-        <div class="kpi-sub">El modelo fue probado sobre 1.498 usuarios reales que nunca vio durante el entrenamiento, garantizando que los resultados son representativos.</div>
+        <div class="kpi-sub">El modelo fue probado sobre {n_test_users:,} usuarios reales que nunca vio durante el entrenamiento, garantizando que los resultados son representativos.</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+st.divider()
+
+# ── Uplift ────────────────────────────────────────────────────────────────────
+st.markdown('<div class="section-title">Ventaja sobre recomendación genérica</div>', unsafe_allow_html=True)
+
+col_u1, col_u2 = st.columns(2)
+
+with col_u1:
+    st.markdown(f"""
+    <div class="kpi-card kpi-accent">
+        <div class="kpi-label">Uplift vs popularidad global</div>
+        <div class="kpi-value">+{round(uplift_pct)}%</div>
+        <div class="kpi-sub">El modelo personalizado encuentra {round(uplift_pct)}% más productos relevantes que recomendar "lo más vendido"</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+with col_u2:
+    st.markdown(f"""
+    <div class="kpi-card">
+        <div class="kpi-label">Productos adicionales por usuario</div>
+        <div class="kpi-value">+{uplift_abs:.1f}</div>
+        <div class="kpi-sub">Productos relevantes extra por usuario respecto al baseline de popularidad global</div>
     </div>
     """, unsafe_allow_html=True)
 
@@ -218,28 +233,23 @@ with col_c:
     """, unsafe_allow_html=True)
 
 st.caption("El sistema nunca devuelve un error por falta de historial — todo usuario recibe recomendaciones.")
-
 st.divider()
 
-# ── Top 10 señales del modelo ─────────────────────────────────────────────────
+# ── Top 10 señales ────────────────────────────────────────────────────────────
 st.markdown('<div class="section-title">¿Qué señales usa el modelo para recomendar?</div>', unsafe_allow_html=True)
 st.caption("Las 10 variables con mayor impacto en las predicciones, en lenguaje de negocio.")
 
 max_importance = max(item["importance"] for item in top10) if top10 else 1
 
 for item in top10:
-    feature     = item["feature"]
-    importance  = item["importance"]
-    label       = FEATURE_LABELS.get(feature, feature)
-    bar_pct     = importance / max_importance
-    bar_color   = COLOR_ACCENT if importance == max_importance else COLOR_SECONDARY
+    feature    = item["feature"]
+    importance = item["importance"]
+    label      = FEATURE_LABELS.get(feature, feature)
+    bar_pct    = importance / max_importance
 
     col_label, col_bar = st.columns([4, 6])
     with col_label:
-        st.markdown(
-            f'<div class="feature-bar-label">🔹 {label}</div>',
-            unsafe_allow_html=True
-        )
+        st.markdown(f'<div class="feature-bar-label">🔹 {label}</div>', unsafe_allow_html=True)
     with col_bar:
         st.progress(bar_pct)
 

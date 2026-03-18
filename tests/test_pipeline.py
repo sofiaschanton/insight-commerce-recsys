@@ -8,6 +8,7 @@ train y mlflow para probar solo la lógica de orquestación del pipeline,
 sin conexión a base de datos, archivos ni MLflow real.
 """
 
+import sys
 from unittest.mock import MagicMock, patch, call
 
 import pandas as pd
@@ -193,3 +194,247 @@ def test_run_pipeline_custom_trials(pipeline_mocks):
     run_pipeline(n_optuna_trials=50)
     call_kwargs = pipeline_mocks["train"].call_args
     assert call_kwargs.kwargs.get("n_optuna_trials") == 50
+
+
+# ── Tests: run_pipeline con USE_S3=true (líneas 171-179) ─────────────────────
+
+def test_run_pipeline_uploads_feature_matrix_to_s3_when_use_s3_true(pipeline_mocks):
+    from src.pipeline import run_pipeline
+    mock_s3 = MagicMock()
+    with patch("src.pipeline.USE_S3", True), \
+         patch("src.pipeline.boto3") as mock_boto3:
+        mock_boto3.client.return_value = mock_s3
+        run_pipeline()
+    mock_boto3.client.assert_called_once_with("s3")
+    mock_s3.put_object.assert_called_once()
+
+
+def test_run_pipeline_s3_key_is_feature_matrix_reference(pipeline_mocks):
+    from src.pipeline import run_pipeline
+    mock_s3 = MagicMock()
+    with patch("src.pipeline.USE_S3", True), \
+         patch("src.pipeline.boto3") as mock_boto3:
+        mock_boto3.client.return_value = mock_s3
+        run_pipeline()
+    kwargs = mock_s3.put_object.call_args.kwargs
+    assert kwargs["Key"] == "feature_matrix_reference.parquet"
+
+
+def test_run_pipeline_s3_bucket_matches_config(pipeline_mocks):
+    from src.pipeline import run_pipeline
+    mock_s3 = MagicMock()
+    with patch("src.pipeline.USE_S3", True), \
+         patch("src.pipeline.boto3") as mock_boto3, \
+         patch("src.pipeline.S3_BUCKET", "my-test-bucket"):
+        mock_boto3.client.return_value = mock_s3
+        run_pipeline()
+    kwargs = mock_s3.put_object.call_args.kwargs
+    assert kwargs["Bucket"] == "my-test-bucket"
+
+
+def test_run_pipeline_does_not_call_s3_when_use_s3_false(pipeline_mocks):
+    from src.pipeline import run_pipeline
+    with patch("src.pipeline.USE_S3", False), \
+         patch("src.pipeline.boto3") as mock_boto3:
+        run_pipeline()
+    mock_boto3.client.assert_not_called()
+
+
+# ── Fixture: mocks para run_snapshot ─────────────────────────────────────────
+
+@pytest.fixture
+def snapshot_mocks():
+    with (
+        patch("src.pipeline.load_data_from_aws", return_value=_FAKE_DATA) as mock_load,
+        patch("src.pipeline.build_feature_matrix", return_value=_FAKE_MATRIX) as mock_build,
+    ):
+        yield {"load": mock_load, "build": mock_build}
+
+
+# ── Tests: run_snapshot USE_S3=false (líneas 213-232, 244-252) ───────────────
+
+def test_run_snapshot_calls_load_data(snapshot_mocks):
+    from src.pipeline import run_snapshot
+    with patch("src.pipeline.USE_S3", False):
+        run_snapshot()
+    snapshot_mocks["load"].assert_called_once()
+
+
+def test_run_snapshot_calls_build_feature_matrix(snapshot_mocks):
+    from src.pipeline import run_snapshot
+    with patch("src.pipeline.USE_S3", False):
+        run_snapshot()
+    snapshot_mocks["build"].assert_called_once_with(_FAKE_DATA, output_path=None)
+
+
+def test_run_snapshot_passes_n_users_and_random_state(snapshot_mocks):
+    from src.pipeline import run_snapshot
+    with patch("src.pipeline.USE_S3", False):
+        run_snapshot(n_users=200, random_state=99)
+    kwargs = snapshot_mocks["load"].call_args.kwargs
+    assert kwargs.get("n_users") == 200
+    assert kwargs.get("random_state") == 99
+
+
+def test_run_snapshot_logs_warning_when_use_s3_false(snapshot_mocks):
+    import src.pipeline as pipeline_mod
+    from src.pipeline import run_snapshot
+    with patch("src.pipeline.USE_S3", False), \
+         patch.object(pipeline_mod.logger, "warning") as mock_warn:
+        run_snapshot()
+    all_warnings = " ".join(str(c) for c in mock_warn.call_args_list)
+    assert "USE_S3=false" in all_warnings
+
+
+def test_run_snapshot_no_s3_call_when_use_s3_false(snapshot_mocks):
+    from src.pipeline import run_snapshot
+    with patch("src.pipeline.USE_S3", False), \
+         patch("src.pipeline.boto3") as mock_boto3:
+        run_snapshot()
+    mock_boto3.client.assert_not_called()
+
+
+def test_run_snapshot_default_args(snapshot_mocks):
+    """Defaults: n_users=None, random_state=42."""
+    from src.pipeline import run_snapshot
+    with patch("src.pipeline.USE_S3", False):
+        run_snapshot()  # no error
+    kwargs = snapshot_mocks["load"].call_args.kwargs
+    assert kwargs.get("n_users") is None
+    assert kwargs.get("random_state") == 42
+
+
+# ── Tests: run_snapshot USE_S3=true (líneas 232-243) ─────────────────────────
+
+def test_run_snapshot_uploads_to_s3_when_use_s3_true(snapshot_mocks):
+    from src.pipeline import run_snapshot
+    mock_s3 = MagicMock()
+    with patch("src.pipeline.USE_S3", True), \
+         patch("src.pipeline.boto3") as mock_boto3:
+        mock_boto3.client.return_value = mock_s3
+        run_snapshot()
+    mock_boto3.client.assert_called_once_with("s3")
+    mock_s3.put_object.assert_called_once()
+
+
+def test_run_snapshot_s3_key_is_monitoring_actual(snapshot_mocks):
+    from src.pipeline import run_snapshot
+    mock_s3 = MagicMock()
+    with patch("src.pipeline.USE_S3", True), \
+         patch("src.pipeline.boto3") as mock_boto3:
+        mock_boto3.client.return_value = mock_s3
+        run_snapshot()
+    kwargs = mock_s3.put_object.call_args.kwargs
+    assert kwargs["Key"] == "monitoring/actual/feature_matrix.parquet"
+
+
+def test_run_snapshot_s3_bucket_matches_config(snapshot_mocks):
+    from src.pipeline import run_snapshot
+    mock_s3 = MagicMock()
+    with patch("src.pipeline.USE_S3", True), \
+         patch("src.pipeline.boto3") as mock_boto3, \
+         patch("src.pipeline.S3_BUCKET", "monitoring-bucket"):
+        mock_boto3.client.return_value = mock_s3
+        run_snapshot()
+    kwargs = mock_s3.put_object.call_args.kwargs
+    assert kwargs["Bucket"] == "monitoring-bucket"
+
+
+def test_run_snapshot_s3_body_is_bytes(snapshot_mocks):
+    from src.pipeline import run_snapshot
+    mock_s3 = MagicMock()
+    with patch("src.pipeline.USE_S3", True), \
+         patch("src.pipeline.boto3") as mock_boto3:
+        mock_boto3.client.return_value = mock_s3
+        run_snapshot()
+    kwargs = mock_s3.put_object.call_args.kwargs
+    assert isinstance(kwargs["Body"], bytes)
+
+
+def test_run_snapshot_s3_expected_bucket_owner_env(snapshot_mocks):
+    """ExpectedBucketOwner se pasa desde AWS_ACCOUNT_ID."""
+    from src.pipeline import run_snapshot
+    mock_s3 = MagicMock()
+    with patch("src.pipeline.USE_S3", True), \
+         patch("src.pipeline.boto3") as mock_boto3, \
+         patch.dict("os.environ", {"AWS_ACCOUNT_ID": "123456789012"}):
+        mock_boto3.client.return_value = mock_s3
+        run_snapshot()
+    kwargs = mock_s3.put_object.call_args.kwargs
+    assert kwargs.get("ExpectedBucketOwner") == "123456789012"
+
+
+# ── Tests: __main__ entry point (líneas 257-286) ─────────────────────────────
+
+def _run_main_with_argv(argv: list):
+    """Ejecuta el bloque __main__ de pipeline.py en un namespace fresco."""
+    import runpy
+    sys.modules.pop("src.pipeline", None)
+    with patch("src.data.data_loader.load_data_from_aws", return_value=_FAKE_DATA), \
+         patch("src.features.feature_engineering.build_feature_matrix", return_value=_FAKE_MATRIX), \
+         patch("src.data.validate_data.validate", return_value=_VALIDATION_OK), \
+         patch("src.models.train.train", return_value=_FAKE_TRAIN_RESULT), \
+         patch("mlflow.set_tracking_uri"), \
+         patch("mlflow.start_run") as mock_run, \
+         patch("mlflow.log_params"), \
+         patch("mlflow.log_metrics"), \
+         patch("mlflow.log_artifact"), \
+         patch("sys.argv", argv):
+        mock_run.return_value.__enter__ = MagicMock(return_value=MagicMock())
+        mock_run.return_value.__exit__ = MagicMock(return_value=False)
+        runpy.run_module("src.pipeline", run_name="__main__", alter_sys=True)
+
+
+def test_main_default_runs_pipeline():
+    """Sin flags, __main__ llama a run_pipeline."""
+    _run_main_with_argv(["pipeline"])
+    # Si no lanzó excepción, el flujo default (run_pipeline) completó OK
+
+
+def test_main_snapshot_only_does_not_crash():
+    """--snapshot-only llama a run_snapshot sin error."""
+    _run_main_with_argv(["pipeline", "--snapshot-only"])
+
+
+def test_main_no_optuna_flag():
+    """--no-optuna llega a train con run_optuna_flag=False."""
+    import runpy
+    sys.modules.pop("src.pipeline", None)
+    mock_train = MagicMock(return_value=_FAKE_TRAIN_RESULT)
+    with patch("src.data.data_loader.load_data_from_aws", return_value=_FAKE_DATA), \
+         patch("src.features.feature_engineering.build_feature_matrix", return_value=_FAKE_MATRIX), \
+         patch("src.data.validate_data.validate", return_value=_VALIDATION_OK), \
+         patch("src.models.train.train", mock_train), \
+         patch("mlflow.set_tracking_uri"), \
+         patch("mlflow.start_run") as mock_run, \
+         patch("mlflow.log_params"), \
+         patch("mlflow.log_metrics"), \
+         patch("mlflow.log_artifact"), \
+         patch("sys.argv", ["pipeline", "--no-optuna"]):
+        mock_run.return_value.__enter__ = MagicMock(return_value=MagicMock())
+        mock_run.return_value.__exit__ = MagicMock(return_value=False)
+        runpy.run_module("src.pipeline", run_name="__main__", alter_sys=True)
+    call_kwargs = mock_train.call_args.kwargs
+    assert call_kwargs.get("run_optuna_flag") is False
+
+
+def test_main_n_users_arg():
+    """--n-users 1000 pasa n_users=1000 a load_data_from_aws."""
+    import runpy
+    sys.modules.pop("src.pipeline", None)
+    mock_load = MagicMock(return_value=_FAKE_DATA)
+    with patch("src.data.data_loader.load_data_from_aws", mock_load), \
+         patch("src.features.feature_engineering.build_feature_matrix", return_value=_FAKE_MATRIX), \
+         patch("src.data.validate_data.validate", return_value=_VALIDATION_OK), \
+         patch("src.models.train.train", return_value=_FAKE_TRAIN_RESULT), \
+         patch("mlflow.set_tracking_uri"), \
+         patch("mlflow.start_run") as mock_run, \
+         patch("mlflow.log_params"), \
+         patch("mlflow.log_metrics"), \
+         patch("mlflow.log_artifact"), \
+         patch("sys.argv", ["pipeline", "--n-users", "1000"]):
+        mock_run.return_value.__enter__ = MagicMock(return_value=MagicMock())
+        mock_run.return_value.__exit__ = MagicMock(return_value=False)
+        runpy.run_module("src.pipeline", run_name="__main__", alter_sys=True)
+    kwargs = mock_load.call_args.kwargs
+    assert kwargs.get("n_users") == 1000

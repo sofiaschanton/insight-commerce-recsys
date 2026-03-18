@@ -145,6 +145,10 @@ env.bak/
 venv.bak/
 venv_2/
 
+# AWS
+AWSCLIV2.pkg
+global-bundle.pem
+
 # Spyder project settings
 .spyderproject
 .spyproject

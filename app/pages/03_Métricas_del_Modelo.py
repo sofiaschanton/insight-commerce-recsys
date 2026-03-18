@@ -135,7 +135,7 @@ st.divider()
 # ── Métricas de evaluación ────────────────────────────────────────────────────
 st.markdown('<div class="section-title">Evaluación sobre set de test</div>', unsafe_allow_html=True)
 
-col1, col2, col3, col4 = st.columns(4)
+col1, col2, col3, col4, col5 = st.columns(5)
 
 with col1:
     st.markdown(f"""
@@ -173,6 +173,15 @@ with col4:
     </div>
     """, unsafe_allow_html=True)
 
+with col5:
+    st.markdown(f"""
+    <div class="kpi-card kpi-accent">
+        <div class="kpi-label">NDCG@10</div>
+        <div class="kpi-value">{metrics.get('ndcg_at_10', 0):.4f}</div>
+        <div class="kpi-sub">Calidad del ranking — considera<br>relevancia y posición de cada producto</div>
+    </div>
+    """, unsafe_allow_html=True)
+
 st.divider()
 
 # ── Split del dataset ─────────────────────────────────────────────────────────
@@ -181,18 +190,17 @@ st.markdown('<div class="section-title">Split del dataset</div>', unsafe_allow_h
 col_a, col_b, col_c = st.columns(3)
 
 splits = [
-    ("Entrenamiento", "n_train_users", "n_train_pairs", "70%", ""),
-    ("Validación",    "n_val_users",   "n_val_pairs",   "15%", ""),
-    ("Test",          "n_test_users",  "n_test_pairs",  "15%", "kpi-accent"),
+    ("Entrenamiento", "train", "70%", ""),
+    ("Validación",    "val",   "15%", ""),
+    ("Test",          "test",  "15%", "kpi-accent"),
 ]
-
-for col, (label, u_key, p_key, pct, css) in zip([col_a, col_b, col_c], splits):
+for col, (label, u_key, pct, css) in zip([col_a, col_b, col_c], splits):
     with col:
         st.markdown(f"""
         <div class="kpi-card {css}">
             <div class="kpi-label">{label} · {pct}</div>
             <div class="kpi-value">{split.get(u_key, 0):,}</div>
-            <div class="kpi-sub">usuarios · {split.get(p_key, 0):,} pares</div>
+            <div class="kpi-sub">usuarios</div>
         </div>
         """, unsafe_allow_html=True)
 
