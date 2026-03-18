@@ -1,0 +1,138 @@
+name: Entrega Continua
+
+on:
+  workflow_run:
+    workflows: ["Integración Continua"]
+    branches: [main]
+    types: [completed]
+
+  workflow_dispatch:
+    inputs:
+      skip_deploy:
+        description: "Solo correr health check sin deploy ECS — solo funciona con workflow_dispatch, no con workflow_run"
+        required: false
+        default: "false"
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+
+jobs:
+  deploy:
+    name: Deploy — ECS rolling update
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      issues: write
+      contents: read
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+
+    steps:
+      - name: Check changed files
+        id: changes
+        if: ${{ github.event_name != 'workflow_dispatch' }}
+        # Nota: inspecciona solo el último commit (head_sha).
+        # Con squash-merge o PRs con >300 archivos la detección puede omitir cambios.
+        # En ese caso usar workflow_dispatch para forzar el deploy manualmente.
+        run: |
+          FILES=$(curl -s \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/commits/${{ github.event.workflow_run.head_sha }}" \
+            | jq -r '.files[].filename')
+          if echo "$FILES" | grep -qE '^(src/|requirements\.txt)'; then
+            echo "should_deploy=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_deploy=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Log — sin cambios en src/ ni requirements.txt
+        if: ${{ github.event_name != 'workflow_dispatch' && steps.changes.outputs.should_deploy == 'false' }}
+        run: |
+          echo "ℹ️ No hay cambios en src/ ni requirements.txt — deploy omitido"
+
+      # AWS credentials siempre configuradas — necesarias también para el rollback
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Force new ECS deployment (rolling update)
+        if: ${{ (github.event_name == 'workflow_dispatch' || steps.changes.outputs.should_deploy == 'true') && github.event.inputs.skip_deploy != 'true' }}
+        run: |
+          aws ecs update-service \
+            --cluster insight-commerce-cluster \
+            --service insight-api-service \
+            --force-new-deployment \
+            --output json | jq '.service.deployments[] | {status, desiredCount, runningCount, pendingCount}'
+
+      - name: Wait for service stability
+        if: ${{ (github.event_name == 'workflow_dispatch' || steps.changes.outputs.should_deploy == 'true') && github.event.inputs.skip_deploy != 'true' }}
+        run: |
+          echo "Esperando que el servicio ECS estabilice..."
+          aws ecs wait services-stable \
+            --cluster insight-commerce-cluster \
+            --services insight-api-service
+          echo "Servicio estable."
+
+      - name: Health check post-deploy
+        if: ${{ github.event_name == 'workflow_dispatch' || steps.changes.outputs.should_deploy == 'true' }}
+        run: |
+          for i in {1..5}; do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+              "http://${{ secrets.ALB_DNS }}/health")
+            if [ "$STATUS" = "200" ]; then
+              echo "✅ API healthy — HTTP $STATUS"
+              exit 0
+            fi
+            echo "⏳ Intento $i/5 — HTTP $STATUS"
+            sleep 10
+          done
+          echo "❌ Health check falló"
+          exit 1
+
+      - name: Smoke test del modelo en producción
+        if: ${{ github.event_name == 'workflow_dispatch' || steps.changes.outputs.should_deploy == 'true' }}
+        run: |
+          pip install requests --quiet
+          python3 -c "
+          import requests
+          r = requests.post(
+              'http://${{ secrets.ALB_DNS }}/recommend',
+              json={'user_id': 13},
+              timeout=10
+          )
+          assert r.status_code == 200, f'HTTP inesperado: {r.status_code}'
+          assert 'recommendations' in r.json(), 'Respuesta inválida'
+          print('✅ Modelo respondiendo correctamente')
+          "
+
+      - name: Rollback ECS si post-deploy falla
+        if: failure()
+        run: |
+          echo "⏪ Iniciando rollback en ECS..."
+          PREV_TASK=$(aws ecs describe-services \
+            --cluster insight-commerce-cluster \
+            --services insight-api-service \
+            --query 'services[0].deployments[1].taskDefinition' \
+            --output text)
+          aws ecs update-service \
+            --cluster insight-commerce-cluster \
+            --service insight-api-service \
+            --task-definition "$PREV_TASK"
+          echo "✅ Rollback completado — modelo anterior restaurado"
+
+      - name: Notify deploy failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              title: '[CD] Deploy fallido — rollback automático ejecutado',
+              body: `Health check o smoke test fallaron. Rollback ejecutado.\nRun: ${context.runId}`,
+              labels: ['rollback', 'cd', 'deploy'],
+            });
