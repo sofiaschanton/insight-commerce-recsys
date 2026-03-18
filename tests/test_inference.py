@@ -20,7 +20,7 @@ Sin DB real ni archivos .pkl reales. SQLAlchemy y joblib se mockean con monkeypa
 
 import json
 from pathlib import Path
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, mock_open, patch, call
 
 import numpy as np
 import pandas as pd
@@ -28,6 +28,7 @@ import pytest
 from sqlalchemy.exc import OperationalError
 
 from src.api.inference import (
+    _ClusterArtifacts,
     DatabaseConnectionError,
     FeatureContractError,
     LoadedArtifacts,
@@ -48,7 +49,7 @@ def _make_service(feature_cols: list) -> RecommendationService:
     service.feature_cols = feature_cols
     service.n_features = len(feature_cols)
     service._artifacts = MagicMock()
-    service._engine = MagicMock()
+    service.engine = MagicMock()
     return service
 
 
@@ -193,10 +194,10 @@ class TestStartup:
         service = _make_full_service()
         artifacts = LoadedArtifacts(
             model=MagicMock(),
-            cluster_models=MagicMock(),
+            clusters=MagicMock(),
             model_log={"model_name": "MyModel", "n_features": 4, "feature_cols": ["a", "b", "c", "d"]},
         )
-        monkeypatch.setattr(service, "_load_artifacts", lambda: artifacts)
+        monkeypatch.setattr(service, "_download_and_load_artifacts", lambda: artifacts)
         monkeypatch.setattr(service, "_build_engine", lambda: MagicMock())
 
         service.startup()
@@ -207,10 +208,10 @@ class TestStartup:
         service = _make_full_service()
         artifacts = LoadedArtifacts(
             model=MagicMock(),
-            cluster_models=MagicMock(),
+            clusters=MagicMock(),
             model_log={"model_name": "M", "n_features": 12, "feature_cols": [f"f{i}" for i in range(12)]},
         )
-        monkeypatch.setattr(service, "_load_artifacts", lambda: artifacts)
+        monkeypatch.setattr(service, "_download_and_load_artifacts", lambda: artifacts)
         monkeypatch.setattr(service, "_build_engine", lambda: MagicMock())
 
         service.startup()
@@ -222,10 +223,10 @@ class TestStartup:
         cols = ["col_x", "col_y", "col_z"]
         artifacts = LoadedArtifacts(
             model=MagicMock(),
-            cluster_models=MagicMock(),
+            clusters=MagicMock(),
             model_log={"model_name": "M", "n_features": 3, "feature_cols": cols},
         )
-        monkeypatch.setattr(service, "_load_artifacts", lambda: artifacts)
+        monkeypatch.setattr(service, "_download_and_load_artifacts", lambda: artifacts)
         monkeypatch.setattr(service, "_build_engine", lambda: MagicMock())
 
         service.startup()
@@ -237,75 +238,88 @@ class TestStartup:
         mock_engine = MagicMock()
         artifacts = LoadedArtifacts(
             model=MagicMock(),
-            cluster_models=MagicMock(),
+            clusters=MagicMock(),
             model_log={"model_name": "M", "n_features": 1, "feature_cols": ["f"]},
         )
-        monkeypatch.setattr(service, "_load_artifacts", lambda: artifacts)
+        monkeypatch.setattr(service, "_download_and_load_artifacts", lambda: artifacts)
         monkeypatch.setattr(service, "_build_engine", lambda: mock_engine)
 
         service.startup()
 
         assert service._artifacts is artifacts
-        assert service._engine is mock_engine
+        assert service.engine is mock_engine
 
 
 # ─── _load_artifacts() ────────────────────────────────────────────────────────
 
 class TestLoadArtifacts:
 
-    def test_returns_loaded_artifacts_instance(self, monkeypatch, tmp_path):
-        service = _make_full_service()
-        service.model_path = tmp_path / "model.pkl"
-        service.cluster_model_path = tmp_path / "cluster_models.pkl"
-        service.model_log_path = tmp_path / "model_log.json"
+    def _valid_cluster_dict(self):
+        """Dict con las claves requeridas por _ClusterArtifacts.from_dict."""
+        return {
+            "scaler_user":      MagicMock(),
+            "kmeans_user":      MagicMock(),
+            "user_profiles":    MagicMock(),
+            "scaler_product":   MagicMock(),
+            "kmeans_product":   MagicMock(),
+            "product_profiles": MagicMock(),
+        }
 
+    def test_returns_loaded_artifacts_instance(self, monkeypatch):
+        service = _make_full_service()
         model_log = {"model_name": "LightGBM", "n_features": 2, "feature_cols": ["a", "b"]}
-        (tmp_path / "model_log.json").write_text(json.dumps(model_log), encoding="utf-8")
 
         mock_model = MagicMock()
-        mock_clusters = MagicMock()
+        valid_clusters = self._valid_cluster_dict()
 
         def fake_load(path):
-            return mock_clusters if "cluster" in str(path) else mock_model
+            return valid_clusters if "cluster" in str(path) else mock_model
 
         monkeypatch.setattr("src.api.inference.joblib.load", fake_load)
+        monkeypatch.setenv("USE_S3", "false")
 
-        result = service._load_artifacts()
+        with patch("builtins.open", mock_open(read_data=json.dumps(model_log))):
+            result = service._download_and_load_artifacts()
 
         assert isinstance(result, LoadedArtifacts)
         assert result.model is mock_model
-        assert result.cluster_models is mock_clusters
+        assert isinstance(result.clusters, _ClusterArtifacts)
 
-    def test_model_log_is_parsed_correctly(self, monkeypatch, tmp_path):
+    def test_model_log_is_parsed_correctly(self, monkeypatch):
         service = _make_full_service()
-        service.model_path = tmp_path / "model.pkl"
-        service.cluster_model_path = tmp_path / "cluster_models.pkl"
-        service.model_log_path = tmp_path / "model_log.json"
-
         model_log = {"model_name": "TestModel", "n_features": 5, "feature_cols": list("abcde")}
-        (tmp_path / "model_log.json").write_text(json.dumps(model_log), encoding="utf-8")
+        valid_clusters = self._valid_cluster_dict()
 
-        monkeypatch.setattr("src.api.inference.joblib.load", MagicMock())
+        def fake_load(path):
+            return valid_clusters if "cluster" in str(path) else MagicMock()
 
-        result = service._load_artifacts()
+        monkeypatch.setattr("src.api.inference.joblib.load", fake_load)
+        monkeypatch.setenv("USE_S3", "false")
+
+        with patch("builtins.open", mock_open(read_data=json.dumps(model_log))):
+            result = service._download_and_load_artifacts()
 
         assert result.model_log["model_name"] == "TestModel"
         assert result.model_log["n_features"] == 5
 
-    def test_joblib_load_called_twice(self, monkeypatch, tmp_path):
+    def test_joblib_load_called_twice(self, monkeypatch):
         service = _make_full_service()
-        service.model_path = tmp_path / "model.pkl"
-        service.cluster_model_path = tmp_path / "cluster_models.pkl"
-        service.model_log_path = tmp_path / "model_log.json"
+        model_log = {"feature_cols": [], "n_features": 0}
+        valid_clusters = self._valid_cluster_dict()
 
-        (tmp_path / "model_log.json").write_text(json.dumps({"feature_cols": [], "n_features": 0}))
+        call_count = {"n": 0}
 
-        mock_load = MagicMock(return_value=MagicMock())
-        monkeypatch.setattr("src.api.inference.joblib.load", mock_load)
+        def fake_load(path):
+            call_count["n"] += 1
+            return valid_clusters if "cluster" in str(path) else MagicMock()
 
-        service._load_artifacts()
+        monkeypatch.setattr("src.api.inference.joblib.load", fake_load)
+        monkeypatch.setenv("USE_S3", "false")
 
-        assert mock_load.call_count == 2
+        with patch("builtins.open", mock_open(read_data=json.dumps(model_log))):
+            service._download_and_load_artifacts()
+
+        assert call_count["n"] == 2
 
 
 # ─── _build_engine() ─────────────────────────────────────────────────────────
@@ -314,19 +328,19 @@ class TestBuildEngine:
 
     def test_raises_if_aws_host_not_set(self, monkeypatch):
         service = _make_full_service()
-        monkeypatch.delenv("AWS_HOST", raising=False)
+        monkeypatch.delenv("DB_HOST", raising=False)
 
-        with pytest.raises(DatabaseConnectionError, match="AWS_HOST"):
+        with pytest.raises(DatabaseConnectionError, match="DB_HOST"):
             service._build_engine()
 
     def test_local_host_lowers_sslmode_to_prefer(self, monkeypatch):
         service = _make_full_service()
-        monkeypatch.setenv("AWS_HOST", "localhost")
-        monkeypatch.setenv("AWS_SSLMODE", "require")
-        monkeypatch.setenv("AWS_USER", "user")
-        monkeypatch.setenv("AWS_PASSWORD", "pass")
-        monkeypatch.setenv("AWS_DATABASE", "db")
-        monkeypatch.setenv("AWS_PORT", "5432")
+        monkeypatch.setenv("DB_HOST", "localhost")
+        monkeypatch.setenv("DB_SSLMODE", "require")
+        monkeypatch.setenv("DB_USER", "user")
+        monkeypatch.setenv("DB_PASSWORD", "pass")
+        monkeypatch.setenv("DB_NAME", "db")
+        monkeypatch.setenv("DB_PORT", "5432")
         monkeypatch.setattr("src.api.inference.create_engine", MagicMock(return_value=MagicMock()))
 
         service._build_engine()
@@ -335,12 +349,12 @@ class TestBuildEngine:
 
     def test_127_0_0_1_lowers_sslmode_to_prefer(self, monkeypatch):
         service = _make_full_service()
-        monkeypatch.setenv("AWS_HOST", "127.0.0.1")
-        monkeypatch.setenv("AWS_SSLMODE", "verify-full")
-        monkeypatch.setenv("AWS_USER", "user")
-        monkeypatch.setenv("AWS_PASSWORD", "pass")
-        monkeypatch.setenv("AWS_DATABASE", "db")
-        monkeypatch.setenv("AWS_PORT", "5432")
+        monkeypatch.setenv("DB_HOST", "127.0.0.1")
+        monkeypatch.setenv("DB_SSLMODE", "verify-full")
+        monkeypatch.setenv("DB_USER", "user")
+        monkeypatch.setenv("DB_PASSWORD", "pass")
+        monkeypatch.setenv("DB_NAME", "db")
+        monkeypatch.setenv("DB_PORT", "5432")
         monkeypatch.setattr("src.api.inference.create_engine", MagicMock(return_value=MagicMock()))
 
         service._build_engine()
@@ -349,12 +363,12 @@ class TestBuildEngine:
 
     def test_remote_host_keeps_require(self, monkeypatch):
         service = _make_full_service()
-        monkeypatch.setenv("AWS_HOST", "my-rds.amazonaws.com")
-        monkeypatch.setenv("AWS_SSLMODE", "require")
-        monkeypatch.setenv("AWS_USER", "admin")
-        monkeypatch.setenv("AWS_PASSWORD", "secret")
-        monkeypatch.setenv("AWS_DATABASE", "mydb")
-        monkeypatch.setenv("AWS_PORT", "5432")
+        monkeypatch.setenv("DB_HOST", "my-rds.amazonaws.com")
+        monkeypatch.setenv("DB_SSLMODE", "require")
+        monkeypatch.setenv("DB_USER", "admin")
+        monkeypatch.setenv("DB_PASSWORD", "secret")
+        monkeypatch.setenv("DB_NAME", "mydb")
+        monkeypatch.setenv("DB_PORT", "5432")
         monkeypatch.setattr("src.api.inference.create_engine", MagicMock(return_value=MagicMock()))
 
         service._build_engine()
@@ -363,12 +377,12 @@ class TestBuildEngine:
 
     def test_invalid_sslmode_falls_back_to_require(self, monkeypatch):
         service = _make_full_service()
-        monkeypatch.setenv("AWS_HOST", "my-rds.amazonaws.com")
-        monkeypatch.setenv("AWS_SSLMODE", "invalid_mode")
-        monkeypatch.setenv("AWS_USER", "admin")
-        monkeypatch.setenv("AWS_PASSWORD", "secret")
-        monkeypatch.setenv("AWS_DATABASE", "mydb")
-        monkeypatch.setenv("AWS_PORT", "5432")
+        monkeypatch.setenv("DB_HOST", "my-rds.amazonaws.com")
+        monkeypatch.setenv("DB_SSLMODE", "invalid_mode")
+        monkeypatch.setenv("DB_USER", "admin")
+        monkeypatch.setenv("DB_PASSWORD", "secret")
+        monkeypatch.setenv("DB_NAME", "mydb")
+        monkeypatch.setenv("DB_PORT", "5432")
         monkeypatch.setattr("src.api.inference.create_engine", MagicMock(return_value=MagicMock()))
 
         service._build_engine()
@@ -377,12 +391,12 @@ class TestBuildEngine:
 
     def test_stores_db_host(self, monkeypatch):
         service = _make_full_service()
-        monkeypatch.setenv("AWS_HOST", "my-rds.amazonaws.com")
-        monkeypatch.setenv("AWS_SSLMODE", "require")
-        monkeypatch.setenv("AWS_USER", "admin")
-        monkeypatch.setenv("AWS_PASSWORD", "secret")
-        monkeypatch.setenv("AWS_DATABASE", "mydb")
-        monkeypatch.setenv("AWS_PORT", "5432")
+        monkeypatch.setenv("DB_HOST", "my-rds.amazonaws.com")
+        monkeypatch.setenv("DB_SSLMODE", "require")
+        monkeypatch.setenv("DB_USER", "admin")
+        monkeypatch.setenv("DB_PASSWORD", "secret")
+        monkeypatch.setenv("DB_NAME", "mydb")
+        monkeypatch.setenv("DB_PORT", "5432")
         monkeypatch.setattr("src.api.inference.create_engine", MagicMock(return_value=MagicMock()))
 
         service._build_engine()
@@ -391,12 +405,12 @@ class TestBuildEngine:
 
     def test_returns_engine(self, monkeypatch):
         service = _make_full_service()
-        monkeypatch.setenv("AWS_HOST", "my-rds.amazonaws.com")
-        monkeypatch.setenv("AWS_SSLMODE", "require")
-        monkeypatch.setenv("AWS_USER", "admin")
-        monkeypatch.setenv("AWS_PASSWORD", "secret")
-        monkeypatch.setenv("AWS_DATABASE", "mydb")
-        monkeypatch.setenv("AWS_PORT", "5432")
+        monkeypatch.setenv("DB_HOST", "my-rds.amazonaws.com")
+        monkeypatch.setenv("DB_SSLMODE", "require")
+        monkeypatch.setenv("DB_USER", "admin")
+        monkeypatch.setenv("DB_PASSWORD", "secret")
+        monkeypatch.setenv("DB_NAME", "mydb")
+        monkeypatch.setenv("DB_PORT", "5432")
 
         mock_engine = MagicMock()
         monkeypatch.setattr("src.api.inference.create_engine", MagicMock(return_value=mock_engine))
@@ -412,7 +426,7 @@ class TestReadSql:
 
     def _make_service_with_engine(self):
         service = _make_full_service()
-        service._engine = MagicMock()
+        service.engine = MagicMock()
         return service
 
     def test_returns_dataframe_on_success(self, monkeypatch):
@@ -461,7 +475,7 @@ class TestReadSql:
             MagicMock(side_effect=_make_op_error()),
         )
 
-        with pytest.raises(DatabaseConnectionError, match="AWS_SSLMODE"):
+        with pytest.raises(DatabaseConnectionError, match="DB_SSLMODE"):
             service._read_sql("SELECT 1", {})
 
     def test_passes_params_to_read_sql(self, monkeypatch):
@@ -485,7 +499,7 @@ class TestQueryUserPrior:
 
     def test_calls_read_sql_with_user_id(self, monkeypatch):
         service = _make_full_service()
-        service._engine = MagicMock()
+        service.engine = MagicMock()
 
         captured = {}
 
@@ -505,7 +519,7 @@ class TestQueryUserPrior:
 
     def test_returns_dataframe(self, monkeypatch):
         service = _make_full_service()
-        service._engine = MagicMock()
+        service.engine = MagicMock()
 
         monkeypatch.setattr(service, "_read_sql", lambda sql, params=None: pd.DataFrame({"col": [1]}))
 
@@ -520,7 +534,7 @@ class TestQueryUserDimProduct:
 
     def test_calls_read_sql_with_product_keys(self, monkeypatch):
         service = _make_full_service()
-        service._engine = MagicMock()
+        service.engine = MagicMock()
 
         captured = {}
 
@@ -551,12 +565,18 @@ class TestAssignUserCluster:
         matrix = self._make_user_matrix(user_id=1)
         user_profiles_ref = pd.DataFrame(index=[2, 3])  # user 1 no está
 
+        clusters = _ClusterArtifacts(
+            scaler_user=MagicMock(),
+            kmeans_user=MagicMock(),
+            user_profiles=user_profiles_ref,
+            scaler_product=MagicMock(),
+            kmeans_product=MagicMock(),
+            product_profiles=MagicMock(),
+        )
         result = RecommendationService._assign_user_cluster(
             matrix=matrix,
             user_id=1,
-            scaler_user=MagicMock(),
-            kmeans_user=MagicMock(),
-            user_profiles_ref=user_profiles_ref,
+            clusters=clusters,
         )
 
         assert (result["user_cluster"] == -1).all()
@@ -574,12 +594,18 @@ class TestAssignUserCluster:
         mock_kmeans = MagicMock()
         mock_kmeans.predict.return_value = np.array([3])
 
+        clusters = _ClusterArtifacts(
+            scaler_user=mock_scaler,
+            kmeans_user=mock_kmeans,
+            user_profiles=user_profiles_ref,
+            scaler_product=MagicMock(),
+            kmeans_product=MagicMock(),
+            product_profiles=MagicMock(),
+        )
         result = RecommendationService._assign_user_cluster(
             matrix=matrix,
             user_id=user_id,
-            scaler_user=mock_scaler,
-            kmeans_user=mock_kmeans,
-            user_profiles_ref=user_profiles_ref,
+            clusters=clusters,
         )
 
         assert (result["user_cluster"] == 3).all()
@@ -597,12 +623,18 @@ class TestAssignUserCluster:
         mock_kmeans = MagicMock()
         mock_kmeans.predict.return_value = np.array([2])
 
+        clusters = _ClusterArtifacts(
+            scaler_user=mock_scaler,
+            kmeans_user=mock_kmeans,
+            user_profiles=user_profiles_ref,
+            scaler_product=MagicMock(),
+            kmeans_product=MagicMock(),
+            product_profiles=MagicMock(),
+        )
         RecommendationService._assign_user_cluster(
             matrix=matrix,
             user_id=user_id,
-            scaler_user=mock_scaler,
-            kmeans_user=mock_kmeans,
-            user_profiles_ref=user_profiles_ref,
+            clusters=clusters,
         )
 
         mock_scaler.transform.assert_called_once()
@@ -630,11 +662,17 @@ class TestAssignProductClusters:
         mock_scaler = MagicMock()
         mock_kmeans = MagicMock()
 
-        result = RecommendationService._assign_product_clusters(
-            matrix=matrix,
+        clusters = _ClusterArtifacts(
+            scaler_user=MagicMock(),
+            kmeans_user=MagicMock(),
+            user_profiles=MagicMock(),
             scaler_product=mock_scaler,
             kmeans_product=mock_kmeans,
-            product_profiles_ref=product_profiles_ref,
+            product_profiles=product_profiles_ref,
+        )
+        result = RecommendationService._assign_product_clusters(
+            matrix=matrix,
+            clusters=clusters,
         )
 
         assert (result["product_cluster"] == -1).all()
@@ -652,28 +690,40 @@ class TestAssignProductClusters:
         mock_kmeans = MagicMock()
         mock_kmeans.predict.return_value = np.array([1, 2], dtype="int8")
 
-        result = RecommendationService._assign_product_clusters(
-            matrix=matrix,
+        clusters = _ClusterArtifacts(
+            scaler_user=MagicMock(),
+            kmeans_user=MagicMock(),
+            user_profiles=MagicMock(),
             scaler_product=mock_scaler,
             kmeans_product=mock_kmeans,
-            product_profiles_ref=product_profiles_ref,
+            product_profiles=product_profiles_ref,
+        )
+        result = RecommendationService._assign_product_clusters(
+            matrix=matrix,
+            clusters=clusters,
         )
 
         assert "product_cluster" in result.columns
         # Los dos productos conocidos deben tener cluster 1 y 2
-        clusters = set(result["product_cluster"].tolist())
-        assert -1 not in clusters
+        product_clusters = set(result["product_cluster"].tolist())
+        assert -1 not in product_clusters
 
     def test_adds_product_cluster_column(self):
         product_keys = [5]
         matrix = self._make_product_matrix(product_keys)
         product_profiles_ref = pd.DataFrame(index=[99])  # desconocido
 
-        result = RecommendationService._assign_product_clusters(
-            matrix=matrix,
+        clusters = _ClusterArtifacts(
+            scaler_user=MagicMock(),
+            kmeans_user=MagicMock(),
+            user_profiles=MagicMock(),
             scaler_product=MagicMock(),
             kmeans_product=MagicMock(),
-            product_profiles_ref=product_profiles_ref,
+            product_profiles=product_profiles_ref,
+        )
+        result = RecommendationService._assign_product_clusters(
+            matrix=matrix,
+            clusters=clusters,
         )
 
         assert "product_cluster" in result.columns
@@ -685,7 +735,7 @@ class TestBuildOnlineMatrix:
 
     def test_empty_prior_raises_user_not_found(self, monkeypatch):
         service = _make_full_service()
-        service._engine = MagicMock()
+        service.engine = MagicMock()
 
         monkeypatch.setattr(service, "_query_user_prior", lambda uid: pd.DataFrame())
 
@@ -694,7 +744,7 @@ class TestBuildOnlineMatrix:
 
     def test_user_not_found_error_message_contains_user_id(self, monkeypatch):
         service = _make_full_service()
-        service._engine = MagicMock()
+        service.engine = MagicMock()
 
         monkeypatch.setattr(service, "_query_user_prior", lambda uid: pd.DataFrame())
 
@@ -721,7 +771,7 @@ class TestRecommendUser:
 
         service._artifacts = MagicMock()
         service._artifacts.model = mock_model
-        service._engine = MagicMock()
+        service.engine = MagicMock()
         return service
 
     def _make_online_matrix(self, feature_cols: list) -> pd.DataFrame:
@@ -749,7 +799,7 @@ class TestRecommendUser:
         monkeypatch.setattr(service, "_query_user_dim_product", lambda pks: self._make_product_names_df())
         service._query_user_order_count = MagicMock(return_value=10)
 
-        result = service.recommend_user(user_id=1, top_k=10)
+        result, _ = service.recommend_user(user_id=1, top_k=10)
 
         assert isinstance(result, list)
         assert all(isinstance(r, dict) for r in result)
@@ -764,7 +814,7 @@ class TestRecommendUser:
         monkeypatch.setattr(service, "_query_user_dim_product", lambda pks: self._make_product_names_df())
         service._query_user_order_count = MagicMock(return_value=10)
 
-        result = service.recommend_user(user_id=1, top_k=10)
+        result, _ = service.recommend_user(user_id=1, top_k=10)
 
         for item in result:
             assert "product_key" in item
@@ -781,7 +831,7 @@ class TestRecommendUser:
         monkeypatch.setattr(service, "_query_user_dim_product", lambda pks: self._make_product_names_df())
         service._query_user_order_count = MagicMock(return_value=10)
 
-        result = service.recommend_user(user_id=1, top_k=3)
+        result, _ = service.recommend_user(user_id=1, top_k=3)
 
         assert len(result) == 3
 
@@ -795,7 +845,7 @@ class TestRecommendUser:
         monkeypatch.setattr(service, "_query_user_dim_product", lambda pks: self._make_product_names_df())
         service._query_user_order_count = MagicMock(return_value=10)
 
-        result = service.recommend_user(user_id=1, top_k=10)
+        result, _ = service.recommend_user(user_id=1, top_k=10)
 
         probabilities = [r["probability"] for r in result]
         assert probabilities == sorted(probabilities, reverse=True)
@@ -810,7 +860,7 @@ class TestRecommendUser:
         monkeypatch.setattr(service, "_query_user_dim_product", lambda pks: self._make_product_names_df())
         service._query_user_order_count = MagicMock(return_value=10)
 
-        result = service.recommend_user(user_id=1, top_k=5)
+        result, _ = service.recommend_user(user_id=1, top_k=5)
 
         assert all(isinstance(r["product_key"], int) for r in result)
 
@@ -824,7 +874,7 @@ class TestRecommendUser:
         monkeypatch.setattr(service, "_query_user_dim_product", lambda pks: self._make_product_names_df())
         service._query_user_order_count = MagicMock(return_value=10)
 
-        result = service.recommend_user(user_id=1, top_k=5)
+        result, _ = service.recommend_user(user_id=1, top_k=5)
 
         assert all(isinstance(r["probability"], float) for r in result)
 
@@ -841,7 +891,7 @@ class TestRecommendUser:
         monkeypatch.setattr(service, "_query_user_dim_product", lambda pks: empty_names)
         service._query_user_order_count = MagicMock(return_value=10)
 
-        result = service.recommend_user(user_id=1, top_k=5)
+        result, _ = service.recommend_user(user_id=1, top_k=5)
 
         assert all(r["product_name"] is None for r in result)
 
@@ -873,10 +923,11 @@ class TestColdStart:
         ])
         service._build_online_matrix = MagicMock()
 
-        result = service.recommend_user(user_id=1, top_k=5)
+        result, cold_start = service.recommend_user(user_id=1, top_k=5)
 
         service._cold_start_top_products.assert_called_once_with(1, 5)
         service._build_online_matrix.assert_not_called()
+        assert cold_start is True
         assert result == [{"product_key": 1, "product_name": "Apple", "probability": 0.5}]
 
     def test_cold_start_not_triggered_when_enough_orders(self):
@@ -890,7 +941,7 @@ class TestColdStart:
         mock_model.predict_proba.return_value = np.array([[0.3, 0.7]])
         service._artifacts = MagicMock()
         service._artifacts.model = mock_model
-        service._engine = MagicMock()
+        service.engine = MagicMock()
 
         service._query_user_order_count = MagicMock(return_value=10)  # 10 >= 5
         service._cold_start_top_products = MagicMock()
@@ -926,7 +977,7 @@ class TestColdStart:
         service._query_user_order_count = MagicMock(return_value=3)  # 3 < 5
         service._cold_start_top_products = MagicMock(return_value=[])
 
-        result = service.recommend_user(user_id=1, top_k=5)
+        result, _ = service.recommend_user(user_id=1, top_k=5)
 
         assert result == []
 
@@ -936,41 +987,41 @@ class TestColdStart:
 class TestLoadModelFromS3:
 
     def test_loads_model_from_s3(self):
-        """Cuando USE_S3=true, _load_artifacts descarga model.pkl desde S3 con boto3."""
-        call_count = 0
-
-        def download_side_effect(bucket, key, fileobj):
-            nonlocal call_count
-            call_count += 1
-            if call_count == 3:  # tercera llamada es model_log.json — necesita JSON válido
-                fileobj.write(
-                    b'{"model_name": "lgbm", "n_features": 2, "feature_cols": ["a", "b"]}'
-                )
-
+        """Cuando USE_S3=true, _download_and_load_artifacts descarga model.pkl desde S3 con boto3."""
         mock_s3 = MagicMock()
-        mock_s3.download_fileobj.side_effect = download_side_effect
+        model_log_json = json.dumps({"model_name": "lgbm", "n_features": 2, "feature_cols": ["a", "b"]})
 
-        with patch("src.api.inference.USE_S3", True), \
+        valid_clusters = {
+            "scaler_user": MagicMock(), "kmeans_user": MagicMock(),
+            "user_profiles": MagicMock(), "scaler_product": MagicMock(),
+            "kmeans_product": MagicMock(), "product_profiles": MagicMock(),
+        }
+
+        def fake_joblib_load(path):
+            return valid_clusters if "cluster" in str(path) else MagicMock()
+
+        with patch.dict("os.environ", {"USE_S3": "true"}), \
              patch("src.api.inference.boto3.client", return_value=mock_s3), \
-             patch("src.api.inference.joblib.load", return_value=MagicMock()):
+             patch("src.api.inference.joblib.load", side_effect=fake_joblib_load), \
+             patch("builtins.open", mock_open(read_data=model_log_json)):
             service = _make_full_service()
-            artifacts = service._load_artifacts()
+            artifacts = service._download_and_load_artifacts()
 
-        assert mock_s3.download_fileobj.call_count == 3
-        first_call_args = mock_s3.download_fileobj.call_args_list[0][0]
-        assert first_call_args[1] == "model.pkl"
+        assert mock_s3.download_file.call_count == 3
+        first_call_args = mock_s3.download_file.call_args_list[0][0]
+        assert "model.pkl" in first_call_args[1]
         assert artifacts is not None
 
     def test_raises_if_s3_download_fails(self):
-        """Si download_fileobj lanza una excepción, _load_artifacts la propaga sin atraparla."""
+        """Si download_file lanza una excepción, _download_and_load_artifacts la propaga."""
         mock_s3 = MagicMock()
-        mock_s3.download_fileobj.side_effect = OSError("S3 connection failed")
+        mock_s3.download_file.side_effect = OSError("S3 connection failed")
 
-        with patch("src.api.inference.USE_S3", True), \
+        with patch.dict("os.environ", {"USE_S3": "true"}), \
              patch("src.api.inference.boto3.client", return_value=mock_s3):
             service = _make_full_service()
             with pytest.raises(OSError):
-                service._load_artifacts()
+                service._download_and_load_artifacts()
 
 
 # ─── TestColdStartTopProducts ─────────────────────────────────────────────────
@@ -1024,3 +1075,185 @@ class TestColdStartTopProducts:
         service._query_user_dim_product.assert_called_once_with([10, 20, 30])
         assert result[0]["product_name"] == "Apple"
         assert result[1]["product_name"] == "Banana"
+
+
+# ─── _ClusterArtifacts.from_dict() — claves faltantes ────────────────────────
+
+class TestClusterArtifactsFromDict:
+
+    def test_raises_key_error_when_dict_is_empty(self):
+        """from_dict con dict vacío debe lanzar KeyError."""
+        with pytest.raises(KeyError):
+            _ClusterArtifacts.from_dict({})
+
+    def test_error_message_mentions_missing_keys(self):
+        """KeyError debe mencionar las claves requeridas."""
+        with pytest.raises(KeyError, match="requeridas"):
+            _ClusterArtifacts.from_dict({})
+
+    def test_raises_when_partial_keys_provided(self):
+        """Falta al menos una clave requerida → KeyError."""
+        partial = {"scaler_user": MagicMock(), "kmeans_user": MagicMock()}
+        with pytest.raises(KeyError):
+            _ClusterArtifacts.from_dict(partial)
+
+
+# ─── _download_and_load_artifacts() — errores S3 ─────────────────────────────
+
+class TestDownloadArtifactsS3Errors:
+
+    def test_client_error_is_propagated(self):
+        """ClientError durante la descarga S3 debe propagarse al caller."""
+        from botocore.exceptions import ClientError
+
+        mock_s3 = MagicMock()
+        mock_s3.download_file.side_effect = ClientError(
+            {"Error": {"Code": "NoSuchKey", "Message": "The specified key does not exist."}},
+            "GetObject",
+        )
+        with patch.dict("os.environ", {"USE_S3": "true"}), \
+             patch("src.api.inference.boto3.client", return_value=mock_s3):
+            service = _make_full_service()
+            with pytest.raises(ClientError):
+                service._download_and_load_artifacts()
+
+    def test_botocore_error_is_propagated(self):
+        """BotoCoreError (red / credentials) durante la descarga S3 debe propagarse."""
+        from botocore.exceptions import NoCredentialsError
+
+        mock_s3 = MagicMock()
+        mock_s3.download_file.side_effect = NoCredentialsError()
+        with patch.dict("os.environ", {"USE_S3": "true"}), \
+             patch("src.api.inference.boto3.client", return_value=mock_s3):
+            service = _make_full_service()
+            with pytest.raises(Exception):
+                service._download_and_load_artifacts()
+
+
+# ─── _build_engine() — variable de entorno faltante ──────────────────────────
+
+class TestBuildEngineMissingEnvVars:
+
+    def test_raises_database_error_when_db_user_missing(self, monkeypatch):
+        """Falta DB_USER → DatabaseConnectionError con mensaje descriptivo."""
+        service = _make_full_service()
+        monkeypatch.setenv("DB_HOST", "my-rds.amazonaws.com")
+        monkeypatch.setenv("DB_SSLMODE", "require")
+        monkeypatch.delenv("DB_USER", raising=False)
+        monkeypatch.delenv("DB_PASSWORD", raising=False)
+        monkeypatch.delenv("DB_NAME", raising=False)
+
+        with pytest.raises(DatabaseConnectionError, match="faltante"):
+            service._build_engine()
+
+
+# ─── _query_product_features() ───────────────────────────────────────────────
+
+class TestQueryProductFeatures:
+
+    def test_calls_read_sql_with_product_keys(self, monkeypatch):
+        service = _make_full_service()
+        service.engine = MagicMock()
+        captured = {}
+        expected_df = pd.DataFrame({
+            "product_key": [1, 2],
+            "product_total_purchases": [100, 200],
+        })
+
+        def fake_read_sql(sql, params=None):
+            captured["params"] = params
+            return expected_df
+
+        monkeypatch.setattr(service, "_read_sql", fake_read_sql)
+
+        result = service._query_product_features([1, 2])
+
+        assert captured["params"]["product_keys"] == [1, 2]
+        assert isinstance(result, pd.DataFrame)
+
+    def test_returns_dataframe(self, monkeypatch):
+        service = _make_full_service()
+        service.engine = MagicMock()
+        monkeypatch.setattr(service, "_read_sql", lambda sql, params=None: pd.DataFrame())
+
+        result = service._query_product_features([10, 20])
+
+        assert isinstance(result, pd.DataFrame)
+
+
+# ─── _get_global_top_products() ──────────────────────────────────────────────
+
+class TestGetGlobalTopProducts:
+
+    def _make_top_df(self) -> pd.DataFrame:
+        return pd.DataFrame({
+            "product_key": [1, 2, 3],
+            "purchase_count": [100, 50, 25],
+            "probability": [0.5, 0.25, 0.125],
+        })
+
+    def _make_names_df(self) -> pd.DataFrame:
+        return pd.DataFrame({
+            "product_key": [1, 2, 3],
+            "product_name": ["Apple", "Banana", "Cherry"],
+        })
+
+    def test_returns_list_when_products_found(self):
+        service = _make_full_service()
+        service._read_sql = MagicMock(return_value=self._make_top_df())
+        service._query_user_dim_product = MagicMock(return_value=self._make_names_df())
+
+        result = service._get_global_top_products(top_k=3)
+
+        assert isinstance(result, list)
+        assert len(result) == 3
+        assert all({"product_key", "product_name", "probability"} <= r.keys() for r in result)
+        assert all(isinstance(r["product_key"], int) for r in result)
+        assert all(isinstance(r["probability"], float) for r in result)
+
+    def test_returns_empty_when_no_products(self):
+        service = _make_full_service()
+        service._read_sql = MagicMock(return_value=pd.DataFrame())
+
+        result = service._get_global_top_products(top_k=10)
+
+        assert result == []
+
+    def test_calls_query_dim_product_for_names(self):
+        service = _make_full_service()
+        service._read_sql = MagicMock(return_value=self._make_top_df())
+        service._query_user_dim_product = MagicMock(return_value=self._make_names_df())
+
+        service._get_global_top_products(top_k=3)
+
+        service._query_user_dim_product.assert_called_once_with([1, 2, 3])
+
+
+# ─── recommend_user() — n_orders == 0 ────────────────────────────────────────
+
+class TestRecommendUserZeroOrders:
+
+    def test_returns_global_top_when_user_not_in_dim_user(self):
+        """n_orders==0 y usuario NO existe en dim_user → _get_global_top_products, cold_start=True."""
+        service = _make_full_service()
+        service._query_user_order_count = MagicMock(return_value=0)
+        # dim_user check returns empty → user does not exist
+        service._read_sql = MagicMock(return_value=pd.DataFrame())
+        mock_top = [{"product_key": 1, "product_name": "A", "probability": 0.5}]
+        service._get_global_top_products = MagicMock(return_value=mock_top)
+
+        result, cold_start = service.recommend_user(user_id=999, top_k=5)
+
+        service._get_global_top_products.assert_called_once_with(5)
+        assert cold_start is True
+        assert result == mock_top
+
+    def test_raises_user_not_found_when_user_in_dim_user_but_no_orders(self):
+        """n_orders==0 y usuario SÍ existe en dim_user → UserNotFoundError."""
+        service = _make_full_service()
+        service._query_user_order_count = MagicMock(return_value=0)
+        # dim_user check returns a row → user exists
+        service._read_sql = MagicMock(return_value=pd.DataFrame({"1": [1]}))
+
+        with pytest.raises(UserNotFoundError):
+            service.recommend_user(user_id=42, top_k=5)

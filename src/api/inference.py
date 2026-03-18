@@ -2,11 +2,12 @@
 inference.py — Insight Commerce · Recsys API
 Entorno destino: AWS Fargate (ECS) + S3 + RDS PostgreSQL
 Autenticación  : IAM Task Role (ecsTaskRole.InsightCommerce) — sin hardcoded keys
-Artefactos     : descargados desde S3 a /tmp/ al iniciar el contenedor
+Artefactos     : descargados desde S3 a un directorio temporal seguro (tempfile.mkdtemp) al iniciar el contenedor
 """
 import json
 import logging
 import os
+import tempfile
 from dataclasses import dataclass
 from typing import Any, Dict, List
 import boto3
@@ -45,10 +46,10 @@ PRODUCT_CLUSTER_FEATURES = [
 
 logger = logging.getLogger("api")
 
-S3_BUCKET: str = os.environ["S3_BUCKET"]
+S3_BUCKET: str = os.getenv("S3_BUCKET", "")
 S3_PREFIX: str = os.getenv("S3_PREFIX", "models")
 
-_TMP             = "/tmp"
+_TMP             = tempfile.mkdtemp(prefix="insight-api-")
 _MODEL_LOCAL     = f"{_TMP}/model.pkl"
 _CLUSTER_LOCAL   = f"{_TMP}/cluster_models.pkl"
 _MODEL_LOG_LOCAL = f"{_TMP}/model_log.json"
@@ -115,6 +116,12 @@ class RecommendationService:
         self._artifacts: LoadedArtifacts | None = None
 
     def startup(self) -> None:
+        use_s3 = os.getenv("USE_S3", "false").lower() == "true"
+        if use_s3 and not S3_BUCKET:
+            raise RuntimeError(
+                "S3_BUCKET no está configurado y USE_S3=true. "
+                "Definir S3_BUCKET en la ECS Task Definition antes de desplegar."
+            )
         self._artifacts   = self._download_and_load_artifacts()
         self.engine       = self._build_engine()
         self.model_name   = str(self._artifacts.model_log.get("model_name",   self.model_name))
@@ -155,7 +162,8 @@ class RecommendationService:
             s3_key = self._s3_key(filename)
             try:
                 logger.info("S3 download | bucket=%s | key=%s → %s", S3_BUCKET, s3_key, local_path)
-                s3.download_file(S3_BUCKET, s3_key, local_path)
+                s3.download_file(S3_BUCKET, s3_key, local_path,
+                                 ExtraArgs={"ExpectedBucketOwner": os.getenv("AWS_ACCOUNT_ID", "")})
                 logger.info("S3 download OK | %s", local_path)
             except ClientError as err:
                 error_code = err.response.get("Error", {}).get("Code", "UNKNOWN")

@@ -127,6 +127,8 @@ N_CLUSTERS_USER    = 5
 N_CLUSTERS_PRODUCT = 5
 N_OPTUNA_TRIALS    = 50
 
+F1_THRESHOLD = 0.10   # Umbral mínimo de F1 para aceptar el modelo (Model Gate)
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -328,7 +330,7 @@ def run_optuna(
     )
     study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
 
-    best = study.best_params
+    best: Dict[str, Any] = study.best_params
     best.update({
         "scale_pos_weight": scale_pos_weight,
         "random_state"    : random_state,
@@ -393,7 +395,8 @@ def train(
 
     # Con esto podemos crear un RUN en MLFlow para guardar las mejores metricas que se guardaron en el modelo
     # MLFlow es como una bitacora para evaluar cual es el mejor modelo en uno u otro caso
-    with mlflow.start_run(run_name="lgbm_kmeans_pipeline"):
+    # El parámetro nested=True permite que este run viva dentro del run del pipeline
+    with mlflow.start_run(run_name="lgbm_kmeans_pipeline", nested=True):
 
         # Registrar parámetros globales del pipeline
         mlflow.log_param("random_state", random_state)
@@ -508,7 +511,8 @@ def train(
             try:
                 _s3 = boto3.client("s3")
                 _buf = io.BytesIO()
-                _s3.download_fileobj(S3_BUCKET, "model_log.json", _buf)
+                _s3.download_fileobj(S3_BUCKET, "models/latest/model_log.json", _buf,
+                                     ExtraArgs={"ExpectedBucketOwner": os.getenv("AWS_ACCOUNT_ID", "")})
                 _buf.seek(0)
                 old_log = json.loads(_buf.read().decode("utf-8"))
             except Exception as _e:
@@ -567,13 +571,47 @@ def train(
         }
         with open(log_path, "w", encoding="utf-8") as f:
             json.dump(log, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
 
-        if USE_S3:
+        # ── 11. Model Gate + Safe Deployment en S3 ───────────────────────────────
+        use_s3_this_run = USE_S3
+        new_f1 = metrics["f1"]
+
+        if new_f1 < F1_THRESHOLD:
+            logger.warning("=" * 60)
+            logger.warning("MODEL GATE: el modelo NO supera el umbral de calidad.")
+            logger.warning(f"  F1 obtenido : {new_f1:.4f}")
+            logger.warning(f"  F1 umbral   : {F1_THRESHOLD:.4f}")
+            logger.warning("  La subida a S3 queda CANCELADA para esta ejecución.")
+            logger.warning("=" * 60)
+            use_s3_this_run = False
+
+        if use_s3_this_run:
+            run_id = mlflow.active_run().info.run_id
             _s3 = boto3.client("s3")
-            _s3.upload_file(str(model_path),   S3_BUCKET, "model.pkl")
-            _s3.upload_file(str(cluster_path), S3_BUCKET, "cluster_models.pkl")
-            _s3.upload_file(str(log_path),     S3_BUCKET, "model_log.json")
-            logger.info(f"Artefactos subidos a s3://{S3_BUCKET}/: model.pkl, cluster_models.pkl, model_log.json")
+
+            # Rutas versionadas — nunca sobreescriben versiones anteriores
+            versioned_model   = f"models/{run_id}/model.pkl"
+            versioned_cluster = f"models/{run_id}/cluster_models.pkl"
+            versioned_log     = f"models/{run_id}/model_log.json"
+
+            _owner = {"ExpectedBucketOwner": os.getenv("AWS_ACCOUNT_ID", "")}
+            _s3.upload_file(str(model_path),   S3_BUCKET, versioned_model,   ExtraArgs=_owner)
+            _s3.upload_file(str(cluster_path), S3_BUCKET, versioned_cluster, ExtraArgs=_owner)
+            _s3.upload_file(str(log_path),     S3_BUCKET, versioned_log,     ExtraArgs=_owner)
+            logger.info(
+                f"Artefactos versionados subidos a s3://{S3_BUCKET}/{versioned_model} (y cluster + log)"
+            )
+
+            # Puntero 'latest' — producción siempre lee lo último que pasó el gate
+            copy_source = {"Bucket": S3_BUCKET, "Key": versioned_model}
+            _s3.copy(copy_source, S3_BUCKET, "models/latest/model.pkl")
+            copy_source["Key"] = versioned_cluster
+            _s3.copy(copy_source, S3_BUCKET, "models/latest/cluster_models.pkl")
+            copy_source["Key"] = versioned_log
+            _s3.copy(copy_source, S3_BUCKET, "models/latest/model_log.json")
+            logger.info(f"Puntero 'latest' actualizado en s3://{S3_BUCKET}/models/latest/")
 
         mlflow.lightgbm.log_model(model, artifact_path="lightgbm_model") # Nombre del modelo lightGBM que se uso y en path donde se guarda en MLFlow
         mlflow.log_artifact(local_path=str(cluster_path), artifact_path="cluster_models") 

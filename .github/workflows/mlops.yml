@@ -1,0 +1,301 @@
+name: MLOps — Drift → Retrain → Deploy
+
+on:
+  schedule:
+    # Domingos 23:00 UTC
+    - cron: "0 23 * * 0"
+  workflow_dispatch:
+    inputs:
+      skip_snapshot:
+        description: "Omitir build-snapshot (usar parquet ya subido a S3)"
+        required: false
+        default: "false"
+      force_retrain:
+        description: "Forzar reentrenamiento aunque no haya drift"
+        required: false
+        default: "false"
+
+env:
+  PYTHON_VERSION: "3.10"
+  S3_BUCKET: ${{ vars.S3_BUCKET }}
+  AWS_REGION: ${{ vars.AWS_REGION }}
+
+jobs:
+  # ── JOB 1: Snapshot semanal ──────────────────────────────────────────────────
+  # Carga datos desde RDS → feature engineering → sube parquet a S3
+  # s3://insight-commerce-artifacts/monitoring/actual/feature_matrix.parquet
+  build-snapshot:
+    name: Build weekly snapshot
+    runs-on: ubuntu-latest
+    if: ${{ github.event.inputs.skip_snapshot != 'true' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Build and upload snapshot to S3
+        env:
+          USE_S3: "true"
+          S3_BUCKET: ${{ env.S3_BUCKET }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ${{ env.AWS_REGION }}
+          # RDS
+          AWS_HOST: ${{ secrets.AWS_HOST }}
+          AWS_DATABASE: ${{ secrets.AWS_DATABASE }}
+          AWS_USER: ${{ secrets.AWS_USER }}
+          AWS_PASSWORD: ${{ secrets.AWS_PASSWORD }}
+          AWS_PORT: ${{ vars.AWS_PORT }}
+          AWS_SSLMODE: ${{ vars.AWS_SSLMODE }}
+        run: python -m src.pipeline --snapshot-only
+
+  # ── JOB 2: Drift check ───────────────────────────────────────────────────────
+  # Compara snapshot actual vs referencia (post-retrain) usando PSI y KS.
+  # No accede a RDS — solo descarga dos parquets desde S3 y calcula métricas.
+  drift-check:
+    name: Drift check (PSI / KS)
+    runs-on: ubuntu-latest
+    needs: build-snapshot
+    if: ${{ always() && (needs.build-snapshot.result == 'success' || github.event.inputs.skip_snapshot == 'true') }}
+    outputs:
+      drift_detected: ${{ steps.parse.outputs.drift_detected }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run drift monitoring
+        env:
+          USE_S3: "true"
+          S3_BUCKET: ${{ env.S3_BUCKET }}
+          S3_CURRENT_KEY: "monitoring/actual/feature_matrix.parquet"
+          S3_REFERENCE_KEY: "feature_matrix_reference.parquet"
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ${{ env.AWS_REGION }}
+          DRIFT_TRIGGERED_BY: "scheduled"
+          GITHUB_RUN_ID: ${{ github.run_id }}
+        run: |
+          mkdir -p reports
+          python -m src.model_monitoring
+
+      - name: Parse drift result
+        id: parse
+        run: |
+          DRIFT=$(python -c "import json; d=json.load(open('drift_report.json')); print(str(d.get('drift_detected', False)).lower())")
+          echo "drift_detected=$DRIFT" >> "$GITHUB_OUTPUT"
+          echo "Drift detected: $DRIFT"
+
+      - name: Upload drift report
+        uses: actions/upload-artifact@v4
+        with:
+          name: drift-report-${{ github.run_id }}
+          path: drift_report.json
+
+      - name: Open GitHub Issue on drift
+        if: ${{ steps.parse.outputs.drift_detected == 'true' }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const report = JSON.parse(fs.readFileSync('drift_report.json', 'utf8'));
+            const psi = report.psi ?? 'N/A';
+            const ks  = report.ks  ?? 'N/A';
+            const ts  = report.timestamp ?? new Date().toISOString();
+
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              title: `[MLOps] Data drift detectado — PSI=${psi}, KS=${ks}`,
+              body: [
+                `## Alerta de Data Drift`,
+                ``,
+                `| Campo | Valor |`,
+                `|-------|-------|`,
+                `| Timestamp | ${ts} |`,
+                `| PSI (umbral 0.25) | ${psi} |`,
+                `| KS (umbral 0.30)  | ${ks} |`,
+                `| Run ID | [${context.runId}](https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}) |`,
+                ``,
+                `### PSI por feature`,
+                '```json',
+                JSON.stringify(report.psi_by_feature ?? {}, null, 2),
+                '```',
+                ``,
+                `### KS por feature`,
+                '```json',
+                JSON.stringify(report.ks_by_feature ?? {}, null, 2),
+                '```',
+                ``,
+                `> El job **retrain** se ejecutará automáticamente en este mismo workflow run.`,
+              ].join('\n'),
+              labels: ['data-drift', 'mlops'],
+            });
+
+  # ── JOB 3: Retrain ───────────────────────────────────────────────────────────
+  # Corre solo si hay drift (o force_retrain=true).
+  # Incluye protección de rollback: si F1_nuevo < F1_anterior * 0.95 → falla el job.
+  retrain:
+    name: Retrain model (Optuna 50 trials)
+    runs-on: ubuntu-latest
+    needs: drift-check
+    if: |
+      needs.drift-check.result == 'success' &&
+      (needs.drift-check.outputs.drift_detected == 'true' || github.event.inputs.force_retrain == 'true')
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Check if first training (no baseline in S3)
+        id: first_train
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ${{ env.AWS_REGION }}
+        run: |
+          if aws s3 ls "s3://${{ env.S3_BUCKET }}/models/model_log.json" > /dev/null 2>&1; then
+            echo "is_first=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_first=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run full pipeline (load → features → retrain)
+        env:
+          USE_S3: "true"
+          S3_BUCKET: ${{ env.S3_BUCKET }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ${{ env.AWS_REGION }}
+          # RDS
+          AWS_HOST: ${{ secrets.AWS_HOST }}
+          AWS_DATABASE: ${{ secrets.AWS_DATABASE }}
+          AWS_USER: ${{ secrets.AWS_USER }}
+          AWS_PASSWORD: ${{ secrets.AWS_PASSWORD }}
+          AWS_PORT: ${{ vars.AWS_PORT }}
+          AWS_SSLMODE: ${{ vars.AWS_SSLMODE }}
+          # MLflow
+          MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
+        run: python -m src.pipeline --trials 50
+
+      - name: Notify first training success
+        if: ${{ steps.first_train.outputs.is_first == 'true' }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              title: '[MLOps] Primer entrenamiento completado exitosamente',
+              body: [
+                `## Primer entrenamiento del modelo`,
+                ``,
+                `El pipeline MLOps completó el primer entrenamiento exitosamente.`,
+                `Los artefactos han sido subidos a S3 y el baseline de referencia ha sido establecido.`,
+                ``,
+                `| Campo | Valor |`,
+                `|-------|-------|`,
+                `| Run ID | [${context.runId}](https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}) |`,
+                `| Timestamp | ${new Date().toISOString()} |`,
+                ``,
+                `> A partir de ahora el drift monitoring comparará distribuciones contra este baseline.`,
+              ].join('\n'),
+              labels: ['mlops'],
+            });
+
+      - name: Notify rollback on failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              title: '[MLOps] Rollback — reentrenamiento rechazado por bajo F1',
+              body: [
+                `## Alerta de Rollback`,
+                ``,
+                `El reentrenamiento fue abortado porque el nuevo modelo no superó el umbral mínimo de calidad.`,
+                `Los artefactos en S3 no fueron modificados — el modelo en producción sigue activo.`,
+                ``,
+                `| Campo | Valor |`,
+                `|-------|-------|`,
+                `| Condición de rollback | F1_nuevo < F1_anterior × 0.95 |`,
+                `| Run ID | [${context.runId}](https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}) |`,
+                `| Timestamp | ${new Date().toISOString()} |`,
+                ``,
+                `> Revisar los logs del job **retrain** para ver las métricas comparadas.`,
+              ].join('\n'),
+              labels: ['rollback', 'mlops'],
+            });
+
+  # ── JOB 4: Deploy ────────────────────────────────────────────────────────────
+  # Rolling update: reinicia los contenedores ECS para que carguen el nuevo modelo desde S3.
+  # No reconstruye la imagen Docker — el modelo se carga desde S3 al arrancar el contenedor.
+  deploy:
+    name: Deploy — ECS rolling update
+    runs-on: ubuntu-latest
+    needs: retrain
+    if: ${{ needs.retrain.result == 'success' }}
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Force new ECS deployment (rolling update)
+        run: |
+          aws ecs update-service \
+            --cluster insight-commerce-cluster \
+            --service insight-api-service \
+            --force-new-deployment \
+            --output json | jq '.service.deployments[] | {status, desiredCount, runningCount, pendingCount}'
+
+      - name: Wait for service stability
+        run: |
+          echo "Esperando que el servicio ECS estabilice..."
+          aws ecs wait services-stable \
+            --cluster insight-commerce-cluster \
+            --services insight-api-service
+          echo "Servicio estable. Deploy completado."
+
+      # Descomentar cuando ALB_DNS esté configurado como secret:
+      # - name: Health check — GET /health
+      #   run: |
+      #     STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+      #       "http://${{ secrets.ALB_DNS }}/health")
+      #     if [ "$STATUS" != "200" ]; then
+      #       echo "Health check falló con HTTP $STATUS"
+      #       exit 1
+      #     fi
+      #     echo "Health check OK — HTTP $STATUS"

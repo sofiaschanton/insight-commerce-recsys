@@ -119,12 +119,6 @@ El sistema evalúa semanalmente la estabilidad de las features (Detalles en [Gu�
 ---
 
 ## Dashboards de Visualización (Streamlit)
-Ofrecemos transparencia total para cada área de la empresa:
-* **`01_Top_10.py`**: Interfaz de cara al cliente final.
-* **`02_Impacto_de_Negocio.py`**: Dashboard de KPIs para el Product Owner.
-* **`03_Metricas_del_Modelo.py`**: Diagnóstico técnico para el equipo de Data Science.
-
-## Dashboards de Visualización (Streamlit)
 
 Ofrecemos transparencia total para cada área de la empresa:
 
@@ -216,6 +210,7 @@ DB_SSLMODE=require
 S3_BUCKET=insight-commerce-artifacts
 S3_PREFIX=models
 USE_S3=false
+AWS_ACCOUNT_ID=account-id
 
 # Streamlit
 API_URL=http://localhost:8000

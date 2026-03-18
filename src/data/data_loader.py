@@ -40,24 +40,47 @@ if not logger.handlers:
 # AWS_USER, AWS_PASSWORD, AWS_HOST, AWS_PORT, AWS_DATABASE
 load_dotenv()
 
-def _build_db_url() -> str:
+def _get_engine():
     """
-    Construye la URL de conexión a AWS RDS usando las variables de entorno.
-    Usamos URL.create() en lugar de f-string para manejar correctamente
-    caracteres especiales en la contraseña (ej: @, #, %).
+    Crea el engine de SQLAlchemy configurando correctamente SSL 
+    para la conexión con AWS RDS.
     """
-    return str(URL.create(
+    # 1. Construir la URL base
+    db_url = URL.create(
         drivername = 'postgresql+psycopg2',
         username   = os.getenv('AWS_USER'),
         password   = os.getenv('AWS_PASSWORD'),
         host       = os.getenv('AWS_HOST'),
         port       = int(os.getenv('AWS_PORT', '5432')),
         database   = os.getenv('AWS_DATABASE'),
-    ))
+    )
+
+    # 2. Configurar argumentos de conexión (SSL)
+    # Leemos el modo desde el .env (por defecto verify-full si queremos usar el certificado)
+    ssl_mode = os.getenv("AWS_SSLMODE", "verify-full")
+    
+    connect_args = {}
+    
+    if ssl_mode in ["verify-full", "verify-ca"]:
+        connect_args["sslmode"] = ssl_mode
+        # Importante: El archivo debe estar en la raíz del proyecto
+        connect_args["sslrootcert"] = "./global-bundle.pem"
+        logger.info(f"Configurando conexión segura SSL (mode: {ssl_mode})")
+    else:
+        connect_args["sslmode"] = ssl_mode # Ej: 'require'
+
+    # 3. Crear el engine con los argumentos de SSL
+    return create_engine(db_url, connect_args=connect_args)
 
 # ─── Configuración de tablas ──────────────────────────────────────────────────
 # Tablas disponibles en el schema dimensional de AWS RDS
 AVAILABLE_TABLES = ['fact_order_products', 'dim_user', 'dim_product']
+
+# Whitelists para prevenir SQL injection en nombres de tabla/esquema (S3649).
+# Los identificadores SQL no admiten parametrización con :param — la validación
+# debe hacerse antes de interpolación.
+ALLOWED_TABLES  = frozenset(AVAILABLE_TABLES)
+ALLOWED_SCHEMAS = frozenset({"public", "analytics"})
 
 # _TABLE_CONFIG define por cada tabla:
 #   sql      → SELECT base sin filtros
@@ -178,26 +201,24 @@ def load_data_from_aws(
 
     # ── Conexión ───────────────────────────────────────────────────────────
     # Si se pasan credenciales externas se construye la URL manualmente,
-    # sino se usa _build_db_url() que lee del .env
+    # sino se usa _get_engine() que lee del .env
+    t0 = time.perf_counter()
     if connection_config:
-        db_url = (
-            f"postgresql+psycopg2://{connection_config.get('AWS_USER')}"
-            f":{connection_config.get('AWS_PASSWORD')}"
-            f"@{connection_config.get('AWS_HOST')}"
-            f":{connection_config.get('AWS_PORT', '5432')}"
-            f"/{connection_config.get('AWS_DATABASE', 'postgres')}"
+        db_url = URL.create(
+            drivername="postgresql+psycopg2",
+            username=connection_config.get("AWS_USER"),
+            password=connection_config.get("AWS_PASSWORD"),
+            host=connection_config.get("AWS_HOST"),
+            port=int(connection_config.get("AWS_PORT", "5432")),
+            database=connection_config.get("AWS_DATABASE", "postgres"),
         )
         logger.info("Usando connection_config externo")
+        engine = create_engine(db_url)
     else:
-        db_url = _build_db_url()
-
-    t0 = time.perf_counter()
-    # sslmode=require es obligatorio en AWS RDS (conexión encriptada)
-    # pool_pre_ping=True verifica la conexión antes de cada query para evitar conexiones muertas
-    engine = create_engine(db_url, connect_args={"connect_timeout": 10, "sslmode": "require"}, pool_pre_ping=True)
+        engine = _get_engine()
     load_log = []  # registro interno para el resumen final
 
-    def _query(sql: str, label: str) -> pd.DataFrame:
+    def _query(sql: str, label: str, params: Optional[dict] = None) -> pd.DataFrame:
         """
         Ejecuta un SQL y devuelve un DataFrame.
         Registra filas, MB y tiempo en load_log para el resumen final.
@@ -207,7 +228,7 @@ def load_data_from_aws(
         status, n_rows, mem_mb = 'OK', 0, 0.0
         try:
             with engine.connect() as conn:  # la conexión se cierra automáticamente al salir del with
-                df = pd.read_sql(text(sql), conn)
+                df = pd.read_sql(text(sql), conn, params=params)
             n_rows = len(df)
             mem_mb = df.memory_usage(deep=True).sum() / 1e6
             logger.info(f"[{label}] {n_rows:>10,} filas | {mem_mb:.1f} MB | {time.perf_counter() - t:.2f}s")
@@ -233,37 +254,63 @@ def load_data_from_aws(
     )
 
     # ── Sampleo de usuarios ────────────────────────────────────────────────
-    # Si n_users está definido, sampleamos N usuarios aleatorios de la fact table
-    # y construimos un string SQL para usarlo como filtro IN en las queries siguientes
-    user_ids_sql = ""
+    # Si n_users está definido, sampleamos N usuarios aleatorios de la fact table.
+    # Los IDs se almacenan como lista de enteros para parametrización con ANY(:user_ids).
     if n_users is not None:
         # Intentamos fijar la semilla en Postgres para reproducibilidad del RANDOM()
         try:
+            seed_val = float(random_state) / float(2**31 - 1)
             with engine.connect() as conn:
-                pd.read_sql(text(f"SELECT setseed({random_state / (2**31 - 1)})"), conn)
+                pd.read_sql(text("SELECT setseed(:seed)"), conn, params={"seed": seed_val})
         except Exception:
             pass  # si falla (ej: permisos) continuamos sin semilla fija
         df_users = _query(
-            f"SELECT user_key FROM (SELECT DISTINCT user_key FROM fact_order_products) u ORDER BY RANDOM() LIMIT {n_users}",
-            label='_sample_users'
+            "SELECT user_key FROM (SELECT DISTINCT user_key FROM fact_order_products) u"
+            " ORDER BY RANDOM() LIMIT :n_users",
+            label='_sample_users',
+            params={"n_users": n_users},
         )
-        user_ids_sql = ', '.join(str(u) for u in df_users['user_key'].tolist())
         logger.info(f"Filtrando por {len(df_users):,} usuarios")
+
+    # Lista de user_ids como enteros para parametrización con ANY(:user_ids)
+    user_ids_list: List[int] = (
+        df_users['user_key'].astype(int).tolist() if n_users is not None else []
+    )
 
     # ── Carga de tablas ────────────────────────────────────────────────────
     result = {}
     for i, tabla in enumerate(tables):
         if esquemas:
-            # Modo esquemas custom: SELECT * con filtro de usuario si aplica
-            where = f"WHERE user_key IN ({user_ids_sql})" if user_ids_sql else ""
-            result[tabla] = _query(f"SELECT * FROM {esquemas[i]}.{tabla} {where}", label=tabla)
+            # Modo esquemas custom: validar contra whitelist antes de interpolar
+            schema = esquemas[i]
+            if schema not in ALLOWED_SCHEMAS:
+                raise ValueError(
+                    f"Esquema '{schema}' no permitido. Válidos: {sorted(ALLOWED_SCHEMAS)}"
+                )
+            if tabla not in ALLOWED_TABLES:
+                raise ValueError(
+                    f"Tabla '{tabla}' no permitida. Válidas: {sorted(ALLOWED_TABLES)}"
+                )
+            # Nombres de identificadores SQL no admiten :param — whitelist es la mitigación
+            if user_ids_list:
+                sql    = f"SELECT * FROM {schema}.{tabla} WHERE user_key = ANY(:user_ids)"
+                params = {"user_ids": user_ids_list}
+            else:
+                sql    = f"SELECT * FROM {schema}.{tabla}"
+                params = None
+            result[tabla] = _query(sql, label=tabla, params=params)
         else:
             # Modo normal: usamos el SQL y casteos definidos en _TABLE_CONFIG
             cfg  = _TABLE_CONFIG[tabla]
             ucol = cfg['user_col']
             # Solo filtramos por usuario si la tabla tiene user_col (dim_product no tiene)
-            where = f"WHERE {ucol} IN ({user_ids_sql})" if user_ids_sql and ucol else ""
-            df = _query(f"{cfg['sql'].strip()} {where}", label=tabla)
+            if user_ids_list and ucol:
+                sql    = f"{cfg['sql'].strip()} WHERE {ucol} = ANY(:user_ids)"
+                params = {"user_ids": user_ids_list}
+            else:
+                sql    = cfg['sql'].strip()
+                params = None
+            df = _query(sql, label=tabla, params=params)
             # Casteamos columnas para reducir uso de RAM
             for col, dtype in cfg['dtypes'].items():
                 df[col] = df[col].astype(dtype)

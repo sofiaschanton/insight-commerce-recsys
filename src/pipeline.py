@@ -13,6 +13,7 @@ Uso:
     python -m src.pipeline
     python -m src.pipeline --no-optuna
     python -m src.pipeline --n-users 5000 --trials 20
+    python -m src.pipeline --snapshot-only
 """
 
 import argparse
@@ -188,6 +189,69 @@ def run_pipeline(
     return result
 
 
+def run_snapshot(
+    n_users: int | None = None,
+    random_state: int = 42,
+) -> None:
+    """
+    Ejecuta solo los pasos 1-2 del pipeline (load → features) y sube el snapshot
+    semanal a S3 para el job de drift monitoring. No entrena modelos.
+
+    El archivo se escribe en:
+        s3://<S3_BUCKET>/monitoring/actual/feature_matrix.parquet
+
+    Este snapshot es luego comparado por model_monitoring.py contra
+    feature_matrix_reference.parquet (baseline del último reentrenamiento).
+
+    Parameters
+    ----------
+    n_users : int | None
+        Usuarios a samplear de RDS. None = todos.
+    random_state : int
+        Semilla para reproducibilidad del sampling.
+    """
+    logger.info("=" * 60)
+    logger.info("Iniciando snapshot semanal (load → features, sin entrenamiento)")
+    logger.info(f"  n_users      : {n_users}")
+    logger.info(f"  random_state : {random_state}")
+    logger.info(f"  USE_S3       : {USE_S3}")
+    logger.info(f"  S3_BUCKET    : {S3_BUCKET}")
+    logger.info("=" * 60)
+
+    # ── Paso 1: Carga de datos ─────────────────────────────────────────────────
+    logger.info("PASO 1 — Carga de datos desde AWS RDS PostgreSQL")
+    data = load_data_from_aws(n_users=n_users, random_state=random_state)
+    logger.info(f"  fact_order_products: {len(data.get('fact_order_products', [])):,} filas")
+
+    # ── Paso 2: Feature engineering ───────────────────────────────────────────
+    logger.info("PASO 2 — Feature engineering (en memoria)")
+    matrix = build_feature_matrix(data, output_path=None)
+    logger.info(f"  Feature matrix: {len(matrix):,} filas x {matrix.shape[1]} columnas")
+
+    # ── Subida a S3 ───────────────────────────────────────────────────────────
+    if USE_S3:
+        s3_key = "monitoring/actual/feature_matrix.parquet"
+        _buf = io.BytesIO()
+        matrix.to_parquet(_buf, index=False)
+        _buf.seek(0)
+        boto3.client("s3").put_object(
+            Bucket=S3_BUCKET,
+            Key=s3_key,
+            Body=_buf.read(),
+            ExpectedBucketOwner=os.getenv("AWS_ACCOUNT_ID", ""),
+        )
+        logger.info(f"Snapshot subido a s3://{S3_BUCKET}/{s3_key} ({len(matrix):,} filas)")
+    else:
+        logger.warning(
+            "USE_S3=false: el snapshot NO fue subido a S3. "
+            "Este modo solo es útil para debug local."
+        )
+
+    logger.info("=" * 60)
+    logger.info("Snapshot semanal completado")
+    logger.info("=" * 60)
+
+
 # ── Entry point ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Pipeline completo: load → features → train")
@@ -207,11 +271,21 @@ if __name__ == "__main__":
         "--seed", type=int, default=42,
         help="Random seed. Default: 42."
     )
+    parser.add_argument(
+        "--snapshot-only", action="store_true",
+        help=(
+            "Solo ejecutar pasos 1-2 (load + features) y subir snapshot semanal a S3. "
+            "No entrena modelos. Usado por el job build-snapshot del pipeline MLOps."
+        ),
+    )
     args = parser.parse_args()
 
-    run_pipeline(
-        n_users         = args.n_users,
-        n_optuna_trials = args.trials,
-        run_optuna_flag = not args.no_optuna,
-        random_state    = args.seed,
-    )
+    if args.snapshot_only:
+        run_snapshot(n_users=args.n_users, random_state=args.seed)
+    else:
+        run_pipeline(
+            n_users         = args.n_users,
+            n_optuna_trials = args.trials,
+            run_optuna_flag = not args.no_optuna,
+            random_state    = args.seed,
+        )

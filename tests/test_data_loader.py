@@ -20,7 +20,7 @@ import os
 import pytest
 import pandas as pd
 from unittest.mock import patch, MagicMock
-from src.data.data_loader import _build_db_url, load_data_from_aws, save_data
+from src.data.data_loader import _get_engine, load_data_from_aws, save_data
 
 PARQUET_PATH = "data/processed/feature_matrix.parquet"
 
@@ -250,7 +250,12 @@ def _mock_engine():
     return engine
 
 
-# ─── _build_db_url ────────────────────────────────────────────────────────────
+# ─── _get_engine (formerly _build_db_url) ────────────────────────────────────
+
+def _engine_url_str(engine) -> str:
+    """Extrae la URL de conexión del engine como string (contraseña incluida)."""
+    return engine.url.render_as_string(hide_password=False)
+
 
 class TestBuildDbUrl:
 
@@ -260,7 +265,8 @@ class TestBuildDbUrl:
         monkeypatch.setenv('AWS_HOST', 'localhost')
         monkeypatch.setenv('AWS_PORT', '5432')
         monkeypatch.setenv('AWS_DATABASE', 'testdb')
-        assert isinstance(_build_db_url(), str)
+        monkeypatch.setenv('AWS_SSLMODE', 'require')
+        assert isinstance(_engine_url_str(_get_engine()), str)
 
     def test_port_accepted_as_int(self, monkeypatch):
         """URL.create() convierte AWS_PORT a int — debe no lanzar excepción."""
@@ -269,7 +275,8 @@ class TestBuildDbUrl:
         monkeypatch.setenv('AWS_HOST', 'localhost')
         monkeypatch.setenv('AWS_PORT', '5433')
         monkeypatch.setenv('AWS_DATABASE', 'testdb')
-        url = _build_db_url()
+        monkeypatch.setenv('AWS_SSLMODE', 'require')
+        url = _engine_url_str(_get_engine())
         assert ':5433/' in url
 
     def test_default_port_is_5432(self, monkeypatch):
@@ -278,7 +285,8 @@ class TestBuildDbUrl:
         monkeypatch.setenv('AWS_HOST', 'localhost')
         monkeypatch.delenv('AWS_PORT', raising=False)
         monkeypatch.setenv('AWS_DATABASE', 'testdb')
-        assert ':5432/' in _build_db_url()
+        monkeypatch.setenv('AWS_SSLMODE', 'require')
+        assert ':5432/' in _engine_url_str(_get_engine())
 
     def test_starts_with_psycopg2_driver(self, monkeypatch):
         monkeypatch.setenv('AWS_USER', 'user')
@@ -286,7 +294,8 @@ class TestBuildDbUrl:
         monkeypatch.setenv('AWS_HOST', 'localhost')
         monkeypatch.setenv('AWS_PORT', '5432')
         monkeypatch.setenv('AWS_DATABASE', 'testdb')
-        assert _build_db_url().startswith('postgresql+psycopg2://')
+        monkeypatch.setenv('AWS_SSLMODE', 'require')
+        assert _engine_url_str(_get_engine()).startswith('postgresql+psycopg2://')
 
 
 # ─── load_data_from_aws — validaciones de entrada ────────────────────────────
