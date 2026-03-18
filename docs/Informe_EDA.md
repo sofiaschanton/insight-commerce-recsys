@@ -6,6 +6,16 @@
 
 ---
 
+## Índice de Contenidos
+1. [Introducción y Metodología](#1-introducción-y-metodología)
+2. [Estructura del Dataset e Integridad de Datos](#2-estructura-del-dataset-e-integridad-de-datos)
+3. [Comportamiento del Usuario y Dinámica del Catálogo](#3-comportamiento-del-usuario-y-dinámica-del-catálogo)
+4. [Análisis de Reorden y Temporalidad](#4-análisis-de-reorden-y-temporalidad)
+5. [Validación del Target y Balance de Clases](#5-validación-del-target-y-balance-de-clases)
+6. [Conclusiones y Directrices para el Modelado](#6-conclusiones-y-directrices-para-el-modelado)
+
+---
+
 ## 1. Introducción y Metodología
 Este informe documenta la exploración y validación de datos necesaria para garantizar la viabilidad del modelo predictivo. El análisis se estructuró en tres fases críticas:
 
@@ -111,7 +121,7 @@ El proceso reveló un desbalance crítico intrínseco al negocio:
 
 ---
 
-## 6. Directrices para el Modelado
+## 6. Conclusiones y Directrices para el Modelado
 
 Como resultado directo de este EDA, se definen las siguientes directrices obligatorias para el modelo:
 
