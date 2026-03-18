@@ -1,150 +1,159 @@
-# Data Dictionary – Recommender System Dataset
+# Data Dictionary – Modelo Dimensional (Star Schema)
 
-## 1. Objetivo del Dataset
+## 1. Objetivo
 
-Este dataset contiene información sobre **usuarios, órdenes y productos comprados**, lo que permite analizar patrones de compra y construir un **sistema de recomendación de productos** basado en el historial de compras de los usuarios.
+Documentar las variables y reglas de negocio del dataset dimensional usado por el sistema de recomendación, para asegurar alineación entre:
 
-Las tablas principales representan:
+- Modelo de datos en base (star schema)
+- Feature engineering
+- Entrenamiento e inferencia
 
-- Usuarios y sus órdenes
-- Productos comprados
-- Categorías de productos
-- Relación entre órdenes y productos
-
----
-
-# Estructura del Dataset
-
-El dataset está compuesto por las siguientes tablas:
-
-- `orders`
-- `order_products_prior`
-- `order_products__train`
-- `products`
-- `aisles`
-- `departments`
+Este documento refleja el modelo definido en `data/local_database/InstaCart_DataBase_Creation_Dimensional.sql`.
 
 ---
 
-# Tabla: `orders`
+## 2. Estructura del modelo dimensional
 
-Información sobre cada orden realizada por los usuarios.
+Tablas productivas del modelo estrella:
 
-| Campo | Tipo | Descripción | Unidad |
-|------|------|-------------|-------
-| order_id | integer | Identificador único de la orden | ID |
-| user_id | integer | Identificador único del usuario | ID |
-| eval_set | string | Indica a qué conjunto pertenece la orden (`prior`, `train`, `test`) | categoría | 
-| order_number | integer | Número de orden del usuario en orden cronológico | conteo |
-| order_dow | integer | Día de la semana en que se realizó la orden | 0–6 |
-| order_hour_of_day | integer | Hora del día en que se realizó la orden | 0–23 |
-| days_since_prior_order | float | Días desde la orden anterior del usuario | días |
-
-### Reglas del dataset
-
-- `order_number = 1` indica la **primera orden del usuario**
-- `days_since_prior_order` puede ser **NULL únicamente en la primera orden**
+- `dim_user` (dimensión)
+- `dim_product` (dimensión)
+- `fact_order_products` (tabla de hechos)
 
 ---
 
-# Tabla: `order_products_prior`
+## 3. Diccionario por tabla
 
-Contiene los productos comprados en órdenes históricas. El entrenamiento se realiza sobre esta tabla.
+### 3.1 Tabla: `dim_user`
 
-| Campo | Tipo | Descripción | Unidad | Nulos | Ejemplo |
-|------|------|-------------|-------|-------|--------|
-| order_id | integer | Identificador de la orden | ID | No | 2 |
-| product_id | integer | Identificador del producto | ID | No | 33120 |
-| add_to_cart_order | integer | Orden en la que el producto fue agregado al carrito | posición | No | 1 |
-| reordered | integer | Indica si el producto fue comprado previamente por el usuario | 0 / 1 | No | 1 |
+| Field            | Type         | Description                                                  | Unit  | Nulls | Example              |
+| ---------------- | ------------ | ------------------------------------------------------------ | ----- | ----- | -------------------- |
+| `user_key`       | integer      | Clave del usuario (surrogate/natural key del dataset fuente) | ID    | No    | 1001                 |
+| `user_name`      | varchar(150) | Nombre del usuario (atributo descriptivo, opcional)          | texto | Sí    | Juan Pérez           |
+| `user_address`   | varchar(300) | Dirección del usuario (atributo descriptivo, opcional)       | texto | Sí    | Av. Siempre Viva 123 |
+| `user_birthdate` | date         | Fecha de nacimiento del usuario (atributo opcional)          | fecha | Sí    | 1992-08-14           |
 
-### Reglas del dataset
+Regla clave:
 
-- `reordered = 1` indica que el usuario **ya compró ese producto anteriormente**
-- `add_to_cart_order` permite analizar **prioridad dentro del carrito**
+- `user_key` es `PRIMARY KEY`.
 
----
+### 3.2 Tabla: `dim_product`
 
-# Tabla: `order_products_train`
+| Field             | Type         | Description                              | Unit      | Nulls | Example      |
+| ----------------- | ------------ | ---------------------------------------- | --------- | ----- | ------------ |
+| `product_key`     | integer      | Clave del producto                       | ID        | No    | 24852        |
+| `product_name`    | varchar(300) | Nombre del producto                      | texto     | No    | Banana       |
+| `aisle_name`      | varchar(100) | Nombre del pasillo (desnormalizado)      | categoría | No    | fresh fruits |
+| `department_name` | varchar(100) | Nombre del departamento (desnormalizado) | categoría | No    | produce      |
 
-Contiene la última orden real de cada usuario y se utiliza
-como target de evaluación del modelo. La variable reordered en esta tabla es el ground
-truth que el modelo intenta predecir.
+Regla clave:
 
-| Campo | Tipo | Descripción | Unidad | 
-|------|------|-------------|-------|
-| order_id | integer | Identificador de la orden | ID |
-| product_id | integer | Identificador del producto | ID |
-| add_to_cart_order | integer | Posición del producto dentro del carrito | posición |
-| reordered | integer | Variable objetivo que indica recompra | 0 / 1 | 
+- `product_key` es `PRIMARY KEY`.
 
-### Uso en el modelo
+### 3.3 Tabla: `fact_order_products`
 
-Esta tabla se utiliza para entrenar el modelo que predice:
+| Field                    | Type        | Description                                              | Unit      | Nulls | Example |
+| ------------------------ | ----------- | -------------------------------------------------------- | --------- | ----- | ------- |
+| `order_key`              | integer     | Identificador de orden                                   | ID        | No    | 123456  |
+| `user_key`               | integer     | Usuario que realizó la orden (`FK -> dim_user.user_key`) | ID        | No    | 1001    |
+| `product_key`            | integer     | Producto comprado (`FK -> dim_product.product_key`)      | ID        | No    | 24852   |
+| `order_dow`              | smallint    | Día de la semana de la orden                             | 0–6       | No    | 2       |
+| `order_hour_of_day`      | smallint    | Hora de la orden                                         | 0–23      | No    | 10      |
+| `days_since_prior_order` | float       | Días desde la orden anterior                             | días      | Sí    | 7.0     |
+| `add_to_cart_order`      | smallint    | Posición en la que se agregó el producto al carrito      | posición  | No    | 1       |
+| `reordered`              | smallint    | Indicador de recompra (0=no, 1=sí)                       | binario   | No    | 1       |
+| `order_number`           | integer     | Número de orden del usuario en secuencia histórica       | conteo    | No    | 12      |
+| `get_eval`               | varchar(10) | Partición temporal/modelado (`prior` o `train`)          | categoría | No    | prior   |
 
-**Qué productos volverá a comprar un usuario en su próxima orden.**
+Reglas clave:
 
----
-
-# Tabla: `products`
-
-Información de cada producto.
-
-| Campo | Tipo | Descripción | Unidad |
-|------|------|-------------|-------|
-| product_id | integer | Identificador único del producto | ID | 
-| product_name | string | Nombre del producto | texto | 
-| aisle_id | integer | Identificador del pasillo | ID | 
-| department_id | integer | Identificador del departamento | ID | 
-
----
-
-# Tabla: `aisles`
-
-Categorías de pasillos dentro del supermercado.
-
-| Campo | Tipo | Descripción | Unidad | 
-|------|------|-------------|-------|-------|--------|
-| aisle_id | integer | Identificador del pasillo | ID |
-| aisle | string | Nombre del pasillo | texto |
+- `PRIMARY KEY (order_key, product_key)`.
+- `get_eval` tiene `CHECK` permitido: `prior`, `train`.
+- `days_since_prior_order` puede ser `NULL` (esperado en primera orden de un usuario).
 
 ---
 
-# Tabla: `departments`
+## 4. Relaciones del modelo estrella
 
-Categorías generales de productos.
+- `fact_order_products.user_key` → `dim_user.user_key`
+- `fact_order_products.product_key` → `dim_product.product_key`
 
-| Campo | Tipo | Descripción | Unidad | 
-|------|------|-------------|-------|
-| department_id | integer | Identificador del departamento | ID |
-| department | string | Nombre del departamento | texto |
+Grano de la tabla de hechos:
+
+- Una fila por par `(order_key, product_key)`.
 
 ---
 
-# Tabla: `users`
+## 5. Variables clave para Feature Engineering
 
-Categorías generales de productos.
+Variables derivadas utilizadas por el pipeline de features/modelado (resumen funcional):
 
-| Campo | Tipo | Descripción | Unidad | 
-|------|------|-------------|-------|
-| user_id | integer | Identificador del usuario | ID |
-| user_name | string | Nombre del usuario | texto |
-| user_address | string | Direccion del usuario | texto |
-| user_age | Int | Edad del usuario | numérico |
+### 5.1 Features de usuario
 
-# Relaciones entre Tablas
+| Field                        | Type            | Description                                              | Unit                 | Nulls | Example |
+| ---------------------------- | --------------- | -------------------------------------------------------- | -------------------- | ----- | ------- |
+| `user_total_orders`          | numeric/integer | Cantidad total de órdenes históricas del usuario         | conteo               | No    | 18      |
+| `user_avg_basket_size`       | float           | Promedio de productos por orden del usuario              | productos/orden      | No    | 9.4     |
+| `user_days_since_last_order` | float           | Recencia de compra del usuario                           | días                 | Sí    | 6.0     |
+| `user_reorder_ratio`         | float           | Proporción histórica de recompra del usuario             | ratio (0–1)          | No    | 0.62    |
+| `user_distinct_products`     | integer         | Cantidad de productos distintos comprados por el usuario | conteo               | No    | 57      |
+| `user_segment_code`          | integer         | Segmento del usuario por frecuencia de compra            | categoría codificada | No    | 3       |
 
-orders.order_id → order_products.order_id
-products.product_id → order_products.product_id
-products.aisle_id → aisles.aisle_id
-products.department_id → departments.department_id
-users.user_id → orders.user_id
+### 5.2 Features de producto
 
-# Reglas de Calidad de Datos
+| Field                       | Type    | Description                                             | Unit              | Nulls | Example |
+| --------------------------- | ------- | ------------------------------------------------------- | ----------------- | ----- | ------- |
+| `product_total_purchases`   | integer | Compras globales del producto                           | conteo            | No    | 2560    |
+| `product_reorder_rate`      | float   | Tasa global de recompra del producto                    | ratio (0–1)       | No    | 0.71    |
+| `product_avg_add_to_cart`   | float   | Posición promedio en carrito del producto               | posición promedio | Sí    | 3.8     |
+| `product_unique_users`      | integer | Cantidad de usuarios únicos que compraron el producto   | conteo            | Sí    | 980     |
+| `p_department_reorder_rate` | float   | Tasa de recompra promedio del departamento del producto | ratio (0–1)       | Sí    | 0.66    |
+| `p_aisle_reorder_rate`      | float   | Tasa de recompra promedio del pasillo del producto      | ratio (0–1)       | Sí    | 0.63    |
 
-1. `order_id` debe ser **único en la tabla orders**
-2. `product_id` debe existir en la tabla **products**
-3. `aisle_id` debe existir en la tabla **aisles**
-4. `department_id` debe existir en la tabla **departments**
-5. `user_id` debe existir en la tabla **users**
-6. `days_since_prior_order` puede ser **NULL únicamente en la primera orden del usuario**
+### 5.3 Features de interacción usuario-producto
+
+| Field                           | Type           | Description                                                   | Unit              | Nulls | Example      |
+| ------------------------------- | -------------- | ------------------------------------------------------------- | ----------------- | ----- | ------------ |
+| `up_times_purchased`            | integer        | Veces que el usuario compró ese producto                      | conteo            | No    | 7            |
+| `up_reorder_rate`               | float          | Frecuencia de recompra del par usuario-producto               | ratio (0–1)       | No    | 0.39         |
+| `up_orders_since_last_purchase` | integer        | Órdenes transcurridas desde última compra del producto        | conteo            | No    | 2            |
+| `up_first_order_number`         | integer        | Número de orden en que apareció por primera vez el producto   | secuencia         | No    | 2            |
+| `up_last_order_number`          | integer        | Número de orden en que apareció por última vez el producto    | secuencia         | No    | 16           |
+| `up_avg_add_to_cart_order`      | float          | Posición promedio del producto en carrito para ese usuario    | posición promedio | Sí    | 2.1          |
+| `up_days_since_last`            | float          | Días desde última compra del par usuario-producto             | días              | Sí    | 9.0          |
+| `up_avg_days_between_orders`    | float          | Promedio de días entre compras del mismo producto por usuario | días              | Sí    | 12.5         |
+| `up_delta_days`                 | float          | Diferencia entre recencia y ciclo promedio del par            | días              | Sí    | -3.5         |
+| `u_favorite_department`         | string/integer | Departamento favorito histórico del usuario                   | categoría         | Sí    | produce      |
+| `u_favorite_aisle`              | string/integer | Pasillo favorito histórico del usuario                        | categoría         | Sí    | fresh fruits |
+
+### 5.4 Variable objetivo
+
+| Field   | Type             | Description                                                              | Unit          | Nulls | Example |
+| ------- | ---------------- | ------------------------------------------------------------------------ | ------------- | ----- | ------- |
+| `label` | smallint/integer | Objetivo del modelo: recompra esperada del par usuario-producto en train | binario (0/1) | No    | 1       |
+
+---
+
+## 6. Reglas de dataset y calidad de datos
+
+Reglas estructurales:
+
+1. Integridad referencial obligatoria de `user_key` y `product_key` desde hechos hacia dimensiones.
+2. Unicidad de `dim_user.user_key` y `dim_product.product_key`.
+3. Unicidad de par `(order_key, product_key)` en hechos.
+4. `get_eval` solo admite valores `prior` y `train`.
+
+Reglas funcionales del proyecto (ETL/modelado):
+
+1. Se excluyen filas `test` del dataset fuente.
+2. Universo de usuarios aptos: al menos 5 órdenes `prior` y al menos 1 orden `train`.
+3. Universo de productos aptos: al menos 50 compras globales.
+4. `days_since_prior_order` nulo es esperado en primeras órdenes.
+
+---
+
+## 7. Definición de terminado (DoD)
+
+- Documento versionado en repositorio en `docs/data_dictionary.md`.
+- Tablas del modelo dimensional estrella documentadas (`dim_user`, `dim_product`, `fact_order_products`).
+- Variables clave de feature engineering y reglas de dataset documentadas para uso de Data Science e Ingeniería.
