@@ -13,6 +13,10 @@ on:
         description: "Forzar reentrenamiento aunque no haya drift"
         required: false
         default: "false"
+      skip_retrain:
+        description: "Omitir retrain aunque haya drift (solo genera issue)"
+        required: false
+        default: "true"
 
 env:
   PYTHON_VERSION: "3.10"
@@ -161,7 +165,7 @@ jobs:
     needs: drift-check
     permissions:
       issues: write
-    if: ${{ needs.drift-check.result == 'success' && (needs.drift-check.outputs.drift_detected == 'true' || github.event.inputs.force_retrain == 'true') }}
+    if: ${{ needs.drift-check.result == 'success' && github.event.inputs.skip_retrain != 'true' && (needs.drift-check.outputs.drift_detected == 'true' || github.event.inputs.force_retrain == 'true') }}
 
     steps:
       - uses: actions/checkout@v4
