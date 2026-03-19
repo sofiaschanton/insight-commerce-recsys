@@ -99,6 +99,7 @@ jobs:
           S3_BUCKET: ${{ env.S3_BUCKET }}
           S3_CURRENT_KEY: "monitoring/actual/feature_matrix.parquet"
           S3_REFERENCE_KEY: "feature_matrix_reference.parquet"
+          AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
           # dinámico: distingue ejecución programada de manual en los reportes
           DRIFT_TRIGGERED_BY: ${{ github.event_name == 'schedule' && 'scheduled' || 'manual' }}
         run: |
