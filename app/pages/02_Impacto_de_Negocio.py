@@ -56,7 +56,7 @@ st.markdown(f"""
     }}
     .feature-bar-label {{
         font-size: 0.85rem;
-        color: #000000;
+        color: #FAFAFA;
         margin-bottom: 0.15rem;
     }}
     .coverage-badge {{

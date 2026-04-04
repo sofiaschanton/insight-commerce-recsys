@@ -72,7 +72,7 @@ st.markdown(f"""
         font-weight: 600;
     }}
     .param-val {{
-        color: #000000;
+        color: #FAFAFA;
         font-family: monospace;
     }}
     .feature-chip {{
