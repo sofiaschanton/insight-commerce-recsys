@@ -1,11 +1,8 @@
-import json
-import os
-from pathlib import Path
 import streamlit as st
+import requests
 
 # ── Configuración ─────────────────────────────────────────────────────────────
-ROOT_DIR = Path(__file__).resolve().parents[2]
-MODEL_LOG_PATH = Path(os.getenv("MODEL_LOG_PATH", ROOT_DIR / "models" / "model_log.json"))
+MODEL_LOG_URL = "https://insight-commerce-artifacts.s3.us-east-2.amazonaws.com/models/model_log.json"
 
 COLOR_PRIMARY   = "#FE495F"
 COLOR_SECONDARY = "#FE9D97"
@@ -59,7 +56,7 @@ st.markdown(f"""
     }}
     .feature-bar-label {{
         font-size: 0.85rem;
-        color: #FAFAFA;
+        color: #000000;
         margin-bottom: 0.15rem;
     }}
     .coverage-badge {{
@@ -77,13 +74,14 @@ st.markdown(f"""
 
 @st.cache_data
 def load_model_log() -> dict:
-    with open(MODEL_LOG_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)
+    response = requests.get(MODEL_LOG_URL, timeout=20)
+    response.raise_for_status()
+    return response.json()
 
 try:
     log = load_model_log()
-except FileNotFoundError:
-    st.error(f"No se encontró model_log.json en {MODEL_LOG_PATH}.")
+except requests.RequestException:
+    st.error(f"No se pudo cargar model_log.json desde {MODEL_LOG_URL}.")
     st.stop()
 
 metrics    = log.get("metrics_test", {})
