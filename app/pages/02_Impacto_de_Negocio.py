@@ -1,8 +1,12 @@
 import streamlit as st
 import requests
+import os
+from dotenv import load_dotenv
+from pathlib import Path
 
 # ── Configuración ─────────────────────────────────────────────────────────────
-MODEL_LOG_URL = "https://insight-commerce-artifacts.s3.us-east-2.amazonaws.com/models/model_log.json"
+load_dotenv(Path(__file__).resolve().parents[2] / ".env")
+MODEL_LOG_URL = os.getenv("MODEL_LOG_URL")
 
 COLOR_PRIMARY   = "#FE495F"
 COLOR_SECONDARY = "#FE9D97"
