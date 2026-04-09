@@ -54,6 +54,7 @@ jobs:
         env:
           USE_S3: "true"
           S3_BUCKET: ${{ env.S3_BUCKET }}
+          AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }} 
           AWS_HOST: ${{ secrets.AWS_HOST }}
           AWS_DATABASE: ${{ secrets.AWS_DATABASE }}
           AWS_USER: ${{ secrets.AWS_USER }}
